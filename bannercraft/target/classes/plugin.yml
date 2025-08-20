@@ -1,0 +1,14 @@
+name: BannerCraft
+version: 0.1.0
+main: com.patrick.BannerCraft
+api-version: "1.21"
+
+commands:
+  battle:
+    description: Start or control battles
+    usage: /battle <start|stop|follow|movehere|charge>
+    permission: bannercraft.battle
+  formation:
+    description: Set troop formation for infantry or archers
+    usage: /formation <infantry|archers> <line|shield|loose>
+    permission: bannercraft.formation
