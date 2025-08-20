@@ -2,13 +2,17 @@ name: BannerCraft
 version: 0.1.0
 main: com.patrick.BannerCraft
 api-version: "1.21"
+author: Patrick
+description: Troop battle/formation plugin
 
 commands:
   battle:
     description: Start or control battles
     usage: /battle <start|stop|follow|movehere|charge>
     permission: bannercraft.battle
+    permission-message: "§cYou don't have permission to use /battle"
   formation:
     description: Set troop formation for infantry or archers
     usage: /formation <infantry|archers> <line|shield|loose>
     permission: bannercraft.formation
+    permission-message: "§cYou don't have permission to use /formation"
