@@ -1,7 +1,5 @@
 package com.patrick;
 
-import org.bukkit.command.Command;
-import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.java.JavaPlugin;
 
@@ -28,6 +26,19 @@ public final class BannerCraft extends JavaPlugin {
                 case "stop"  -> battle.stopBattle();
                 default      -> p.sendMessage("/battle <start|stop>");
             }
+            return true;
+        });
+
+        // /start
+        getCommand("start").setExecutor((sender, command, label, args) -> {
+            if (!(sender instanceof Player p)) return true;
+            if (!battle.isBattleRunning()) {
+                p.sendMessage("§cNo battle is running.");
+                return true;
+            }
+
+            battle.beginCombat();
+            p.sendMessage("§aBattle started!");
             return true;
         });
 

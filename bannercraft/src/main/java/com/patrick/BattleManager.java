@@ -11,6 +11,7 @@ import org.bukkit.GameMode;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
+import org.bukkit.attribute.Attribute;
 import org.bukkit.entity.Arrow;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Mob;
@@ -41,10 +42,18 @@ public class BattleManager implements Listener {
     private Formation archFormation = Formation.LINE;
     private Location infAnchor, archAnchor;
 
+    private enum CommandMode { NORMAL, CHARGE, FOLLOW, HOLD }
+    private CommandMode commandMode = CommandMode.NORMAL;
+    private Player followTarget = null;
+
     private boolean frozen = false;
 
     // per-skeleton shot cooldown (ticks)
     private final Map<UUID, Integer> archerCd = new HashMap<>();
+
+    // persistent per-mob formation slot assignment (mob UUID -> slot index)
+    private final Map<UUID, Integer> formationAssignments = new HashMap<>();
+
 
     // per-group reformation hold (ticks remaining) — during this, combat is paused for that group
     private int infReformTicks = 0;
@@ -53,37 +62,48 @@ public class BattleManager implements Listener {
     public BattleManager(BannerCraft plugin) { this.plugin = plugin; }
 
     public void startBattle(Player p) {
-        if (battleRunning) { p.sendMessage("§cBattle already running!"); return; }
+        if (battleRunning) { 
+            p.sendMessage("§cBattle already running!"); 
+            return; 
+        }
         battleRunning = true;
 
         arena.createArena();
+        arena.buildDivider();
         arena.sendToArena(p);
         giveCommandSticks(p);
 
-        // spectator setup window
-        p.setGameMode(GameMode.SPECTATOR);
+        // Player in survival right away
+        p.setGameMode(GameMode.SURVIVAL);
 
         // spawn + anchors
         Location center = arena.getPlatformCenter();
         infAnchor  = center.clone().add(0, 0, -5);
         archAnchor = center.clone().add(0, 0, -9);
 
-        spawnPlayerTroops(center);
-        // enemies inside platform, opposite side
-        spawnEnemyTroops(center.clone().add(0, 0, 3));
+        // no freeze window
+        setFrozen(false);
 
-        // freeze everyone for 30s
-        setFrozen(true);
-        p.sendMessage("§eTop-down setup: 30s. Troops frozen.");
+    // Reset any previous command state so a new battle starts in NORMAL mode
+    this.commandMode = CommandMode.NORMAL;
+    this.followTarget = null;
+    this.formationAssignments.clear();
 
-        // after 30s -> drop player + start combat (NO formation ticker)
-        Bukkit.getScheduler().runTaskLater(plugin, () -> {
-            p.setGameMode(GameMode.SURVIVAL);
-            setFrozen(false);
-            startCombatTicker();
-            p.sendMessage("§aBattle begins!");
-        }, 20L * 30);
+        // just wait for /start to actually drop divider + order combat
+        p.sendMessage("§eTroops are ready. Use /start when ready to begin!");
     }
+
+    public void beginCombat() {
+        if (!battleRunning) return;
+        arena.removeDivider();
+        spawnEnemyTroops();
+        startCombatTicker();
+        this.commandMode = CommandMode.NORMAL;
+        this.followTarget = null;
+        Bukkit.broadcastMessage("§cThe battle has begun!");
+    }
+
+
 
     public void stopBattle() {
         battleRunning = false;
@@ -103,9 +123,12 @@ public class BattleManager implements Listener {
         // remove command sticks and sweep only our named battle mobs across all worlds
         for (Player pl : Bukkit.getOnlinePlayers()) {
             pl.getInventory().remove(Material.STICK);
-            pl.getInventory().remove(Material.BLAZE_ROD);
+            pl.getInventory().remove(Material.REDSTONE_TORCH);
+            pl.getInventory().remove(Material.LIME_DYE);
+            pl.getInventory().remove(Material.GRAY_DYE);
             arena.sendBack(pl);
         }
+
         for (World w : Bukkit.getWorlds()) {
             w.getEntities().forEach(ent -> {
                 if (ent instanceof Zombie || ent instanceof Skeleton) {
@@ -120,50 +143,57 @@ public class BattleManager implements Listener {
     }
 
     private void giveCommandSticks(Player p) {
-        ItemStack infStick = new ItemStack(Material.STICK);
-        ItemMeta im = infStick.getItemMeta(); im.setDisplayName("§aInfantry Command Stick"); infStick.setItemMeta(im);
-        ItemStack archStick = new ItemStack(Material.BLAZE_ROD);
-        ItemMeta am = archStick.getItemMeta(); am.setDisplayName("§bArcher Command Stick"); archStick.setItemMeta(am);
-        p.getInventory().addItem(infStick, archStick);
+        ItemStack spawnTool = new ItemStack(Material.STICK);
+        ItemMeta st = spawnTool.getItemMeta(); st.setDisplayName("§eTroop Spawner"); spawnTool.setItemMeta(st);
+
+        ItemStack torch = new ItemStack(Material.REDSTONE_TORCH);
+        ItemMeta tm = torch.getItemMeta(); tm.setDisplayName("§cCharge!"); torch.setItemMeta(tm);
+
+        ItemStack lime = new ItemStack(Material.LIME_DYE);
+        ItemMeta lm = lime.getItemMeta(); lm.setDisplayName("§aFollow Me!"); lime.setItemMeta(lm);
+
+        ItemStack hold = new ItemStack(Material.GRAY_DYE);
+        ItemMeta hm = hold.getItemMeta(); hm.setDisplayName("§7Hold Position!"); hold.setItemMeta(hm);
+
+        p.getInventory().addItem(spawnTool, torch, lime, hold);
     }
 
-    private void spawnPlayerTroops(Location center) {
-        for (int i = 0; i < 5; i++) {
-            Zombie z = center.getWorld().spawn(center.clone().add(i, 0, 2), Zombie.class);
+    public void spawnPlayerTroop(Location loc, boolean infantryType) {
+        if (infantryType) {
+            Zombie z = loc.getWorld().spawn(loc, Zombie.class);
             z.setCustomName("Infantry");
             z.setShouldBurnInDay(false);
             prepareMob(z);
             infantry.add(z);
-        }
-        for (int i = 0; i < 3; i++) {
-            Skeleton s = center.getWorld().spawn(center.clone().add(i, 0, -2), Skeleton.class);
+        } else {
+            Skeleton s = loc.getWorld().spawn(loc, Skeleton.class);
             s.setCustomName("Archer");
             s.setShouldBurnInDay(false);
             prepareMob(s);
             archers.add(s);
         }
-        placeGroup(infantry, infAnchor, infFormation);
-        placeGroup(archers,  archAnchor, archFormation);
     }
 
-    private void spawnEnemyTroops(Location center) {
+
+    private void spawnEnemyTroops() {
+        Location center = arena.getEnemySideCenter();
         for (int i = 0; i < 5; i++) {
-            Zombie z = center.getWorld().spawn(center.clone().add(i, 0, 2), Zombie.class);
-            z.setCustomName("Enemy Infantry");
-            z.setShouldBurnInDay(false);
-            prepareMob(z);
-            enemyInfantry.add(z);
+            Zombie bandit = center.getWorld().spawn(center.clone().add(i, 0, 2), Zombie.class);
+            bandit.setCustomName("Bandit");
+            bandit.setShouldBurnInDay(false);
+            prepareMob(bandit);
+
+            // Equip sword
+            bandit.getEquipment().setItemInMainHand(new ItemStack(Material.IRON_SWORD));
+
+            // Buff health
+            bandit.getAttribute(Attribute.MAX_HEALTH).setBaseValue(30.0);
+            bandit.setHealth(30.0);
+
+            enemyInfantry.add(bandit);
         }
-        for (int i = 0; i < 3; i++) {
-            Skeleton s = center.getWorld().spawn(center.clone().add(i, 0, -2), Skeleton.class);
-            s.setCustomName("Enemy Archer");
-            s.setShouldBurnInDay(false);
-            prepareMob(s);
-            enemyArchers.add(s);
-        }
-        placeGroup(enemyInfantry, center.clone().add(0, 0, 3), Formation.SHIELD_WALL);
-        placeGroup(enemyArchers,  center.clone().add(0, 0, -3), Formation.LINE);
     }
+
 
     private void prepareMob(Mob mob) {
         Bukkit.getMobGoals().removeAllGoals(mob);
@@ -219,12 +249,25 @@ public class BattleManager implements Listener {
             }
 
             // Allies act (skip groups that are reforming)
-            autoCombat(infReforming  ? List.of() : infantry,
-                       archReforming ? List.of() : archers,
-                       enemyInfantry, enemyArchers);
+            if (!(infReforming || archReforming)) {
+                if (commandMode == CommandMode.HOLD) {
+                    // do nothing – troops stay in place
+                } else if (commandMode == CommandMode.FOLLOW && followTarget != null) {
+                    moveGroupInFormation(infantry, followTarget.getLocation().add(0, 0, 2), infFormation);
+                    moveGroupInFormation(archers,  followTarget.getLocation().add(0, 0, -2), archFormation);
+                } else if (commandMode == CommandMode.CHARGE) {
+                    // charge = actively target enemies
+                    List<LivingEntity> enemyTargets = new ArrayList<>();
+                    enemyInfantry.stream().filter(e -> !e.isDead()).forEach(enemyTargets::add);
+                    autoCombat(infantry, archers, enemyTargets);
+                }
+            }
 
-            // Enemies act (simple mirror; no reformation for them)
-            autoCombat(enemyInfantry, enemyArchers, infantry, archers);
+            // Enemies act (bandits only)
+            List<LivingEntity> allyTargets = new ArrayList<>();
+            infantry.stream().filter(e -> !e.isDead()).forEach(allyTargets::add);
+            archers.stream().filter(e -> !e.isDead()).forEach(allyTargets::add);
+            autoCombat(enemyInfantry, new ArrayList<>(), allyTargets);
 
             checkWinLose();
 
@@ -232,6 +275,7 @@ public class BattleManager implements Listener {
             archerCd.replaceAll((id, cd) -> Math.max(0, cd - 10));
         }, 10L, 10L);
     }
+
 
     private void stopCombatTicker() {
         if (combatTaskId != -1) {
@@ -244,23 +288,105 @@ public class BattleManager implements Listener {
     private <T extends LivingEntity> void placeGroup(List<T> troops, Location anchor, Formation f) {
         var offsets = f.getOffsets(troops.size());
         for (int i = 0; i < troops.size(); i++) {
-            troops.get(i).teleport(anchor.clone().add(offsets.get(i)));
+            Location target = anchor.clone().add(offsets.get(i));
+
+            // snap X/Z to block center so placement is exact
+            target.setX(Math.floor(target.getX()) + 0.5);
+            target.setZ(Math.floor(target.getZ()) + 0.5);
+
+            // Face the enemy side center instead of hardcoding north
+            Location enemyCenter = arena.getEnemySideCenter();
+            target.setDirection(enemyCenter.toVector().subtract(target.toVector()));
+
+            troops.get(i).teleport(target);
         }
     }
+
 
     // gentle walking to slots (call once when reforming)
     private <T extends Mob> void moveGroupInFormation(List<T> troops, Location anchor, Formation f) {
         var offsets = f.getOffsets(troops.size());
-        for (int i = 0; i < troops.size(); i++) {
-            T mob = troops.get(i);
-            if (mob.isDead()) continue;
-            Location slot = anchor.clone().add(offsets.get(i));
-            if (mob.getLocation().distanceSquared(slot) > 1.5) {
-                mob.getPathfinder().moveTo(slot, 1.05D);
-                mob.setTarget(null);
+
+        // Build concrete slot locations from offsets
+        List<Location> slots = new ArrayList<>();
+        for (int i = 0; i < offsets.size(); i++) {
+            slots.add(anchor.clone().add(offsets.get(i)));
+        }
+
+        // Also build centered-slot locations (snap X/Z to block center) so mobs line up exactly
+        List<Location> centeredSlots = new ArrayList<>();
+        for (Location s : slots) {
+            Location c = s.clone();
+            c.setX(Math.floor(c.getX()) + 0.5);
+            c.setZ(Math.floor(c.getZ()) + 0.5);
+            centeredSlots.add(c);
+        }
+
+        // Collect available (alive) mobs
+        List<T> available = new ArrayList<>();
+        for (T m : troops) if (!m.isDead()) available.add(m);
+
+    // Greedy assignment with stability: prefer previously assigned slot for each mob
+        Map<T, Location> assignment = new HashMap<>();
+        // Track which slots are taken
+    boolean[] slotTaken = new boolean[centeredSlots.size()];
+
+        // First, try to reapply previous assignments (stable slot index to same mob UUID)
+        for (T m : troops) {
+            if (m.isDead()) continue;
+            Integer idx = formationAssignments.get(m.getUniqueId());
+            if (idx != null && idx >= 0 && idx < centeredSlots.size() && !slotTaken[idx]) {
+                assignment.put(m, centeredSlots.get(idx));
+                slotTaken[idx] = true;
+                available.remove(m);
             }
         }
-    }
+
+        // Then greedily fill remaining slots with nearest remaining mobs
+        for (int i = 0; i < centeredSlots.size(); i++) {
+            if (slotTaken[i]) continue;
+            Location slot = centeredSlots.get(i);
+            T best = null;
+            double bestDist = Double.MAX_VALUE;
+            for (T m : available) {
+                double d = m.getLocation().distanceSquared(slot);
+                if (d < bestDist) { bestDist = d; best = m; }
+            }
+            if (best != null) {
+                assignment.put(best, slot);
+                formationAssignments.put(best.getUniqueId(), i);
+                available.remove(best);
+                slotTaken[i] = true;
+            }
+        }
+
+        // Move assigned mobs toward their unique slots and orient them
+        Location enemyCenter = arena.getEnemySideCenter();
+        for (Map.Entry<T, Location> e : assignment.entrySet()) {
+            T mob = e.getKey();
+            Location slot = e.getValue();
+
+            double distSq = mob.getLocation().distanceSquared(slot);
+            // If we're pretty close to the centered slot, snap exactly to it and set facing
+            if (distSq <= 0.9) {
+                // make a copy to set direction toward enemy center
+                Location snap = slot.clone();
+                snap.setDirection(enemyCenter.toVector().subtract(snap.toVector()));
+                mob.teleport(snap);
+                // clear velocity so they don't slide after teleport
+                mob.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
+                mob.setTarget(null);
+            } else {
+                mob.getPathfinder().moveTo(slot, 1.05D);
+                mob.setTarget(null);
+
+                // While moving, keep them roughly oriented toward the enemy
+                mob.teleport(mob.getLocation().setDirection(
+                    enemyCenter.toVector().subtract(mob.getLocation().toVector())
+                ));
+            }
+        }
+}
 
     // ===== Formation setters (do NOT anchor to player; use current centroid) =====
     public void setInfantryFormation(Formation f, Location ignored) {
@@ -273,7 +399,10 @@ public class BattleManager implements Listener {
         } else {
             // mid-battle: walk into the new shape and pause their combat briefly
             infReformTicks = 80; // ~4s
-            moveGroupInFormation(infantry, infAnchor, infFormation);
+            // preassign slots deterministically so the first move call is stable
+            initializeFormationAssignments(infantry, infAnchor, infFormation);
+            // run a short burst of movement+snap checks so they settle on first command
+            scheduleFormationBurst(infantry, infAnchor, infFormation);
         }
     }
 
@@ -285,7 +414,88 @@ public class BattleManager implements Listener {
             archReformTicks = 0;
         } else {
             archReformTicks = 80;
-            moveGroupInFormation(archers, archAnchor, archFormation);
+            // preassign slots deterministically so the first move call is stable
+            initializeFormationAssignments(archers, archAnchor, archFormation);
+            scheduleFormationBurst(archers, archAnchor, archFormation);
+        }
+    }
+
+    // Call moveGroupInFormation several times over a short period so mobs finish
+    // their pathing approach and snap without requiring the user to re-run the command.
+    private <T extends Mob> void scheduleFormationBurst(List<T> troops, Location anchor, Formation f) {
+        // First call immediately so they start moving toward slots.
+        moveGroupInFormation(troops, anchor, f);
+
+        // Then run a periodic check: if a sufficient fraction of troops are within
+        // the snap radius of their assigned slot, perform the final snap. Timeout
+        // after ~6 seconds (120 ticks) to avoid never completing.
+        final int[] ticks = new int[] { 0 };
+        final int[] holder = new int[1];
+
+        // precompute centered slots from formation offsets
+        var offsets = f.getOffsets(troops.size());
+        List<Location> centeredSlots = new ArrayList<>();
+        for (int i = 0; i < offsets.size(); i++) {
+            Location s = anchor.clone().add(offsets.get(i));
+            s.setX(Math.floor(s.getX()) + 0.5);
+            s.setZ(Math.floor(s.getZ()) + 0.5);
+            centeredSlots.add(s);
+        }
+
+        holder[0] = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
+            if (!battleRunning) {
+                Bukkit.getScheduler().cancelTask(holder[0]);
+                return;
+            }
+            ticks[0] += 10;
+
+            // Count troops close to their assigned centered slot
+            int close = 0, total = 0;
+            for (T m : troops) {
+                if (m.isDead()) continue;
+                total++;
+                Integer idx = formationAssignments.get(m.getUniqueId());
+                if (idx == null || idx < 0 || idx >= centeredSlots.size()) continue;
+                Location slot = centeredSlots.get(idx);
+                double d2 = m.getLocation().distanceSquared(slot);
+                if (d2 <= 1.2) close++; // ~1.1 blocks squared threshold
+            }
+
+            // condition: at least 70% are close, or timeout reached
+            if (total > 0 && (close * 100 / total >= 70 || ticks[0] >= 120)) {
+                moveGroupInFormation(troops, anchor, f);
+                Bukkit.getScheduler().cancelTask(holder[0]);
+            }
+        }, 10L, 10L);
+    }
+
+    // Deterministically assign each alive troop to a centered slot so the first reform
+    // tick will already have stable assignments and snap behavior.
+    private <T extends Mob> void initializeFormationAssignments(List<T> troops, Location anchor, Formation f) {
+        var offsets = f.getOffsets(troops.size());
+        List<Location> centeredSlots = new ArrayList<>();
+        for (int i = 0; i < offsets.size(); i++) {
+            Location s = anchor.clone().add(offsets.get(i));
+            s.setX(Math.floor(s.getX()) + 0.5);
+            s.setZ(Math.floor(s.getZ()) + 0.5);
+            centeredSlots.add(s);
+        }
+
+        List<T> available = new ArrayList<>();
+        for (T m : troops) if (!m.isDead()) available.add(m);
+
+        // Greedy: for each slot, pick the nearest available mob and record its slot index
+        for (int i = 0; i < centeredSlots.size() && !available.isEmpty(); i++) {
+            Location slot = centeredSlots.get(i);
+            T best = null; double bestDist = Double.MAX_VALUE;
+            for (T m : available) {
+                double d = m.getLocation().distanceSquared(slot);
+                if (d < bestDist) { bestDist = d; best = m; }
+            }
+            if (best != null) {
+                formationAssignments.put(best.getUniqueId(), i);
+                available.remove(best);
+            }
         }
     }
 
@@ -303,17 +513,16 @@ public class BattleManager implements Listener {
 
     // ===== Simple auto-combat (melee hits + archer kiting & shots) =====
     private void autoCombat(List<Zombie> meleeAllies, List<Skeleton> rangedAllies,
-                            List<Zombie> meleeEnemies, List<Skeleton> rangedEnemies) {
+                        List<LivingEntity> enemies) {
 
-        List<LivingEntity> enemies = new ArrayList<>();
-        meleeEnemies.stream().filter(e -> !e.isDead()).forEach(enemies::add);
-        rangedEnemies.stream().filter(e -> !e.isDead()).forEach(enemies::add);
-        if (enemies.isEmpty()) return;
+        List<LivingEntity> targets = new ArrayList<>();
+        enemies.stream().filter(e -> !e.isDead()).forEach(targets::add);
+        if (targets.isEmpty()) return;
 
         // melee: close gap and attack
         for (Zombie z : meleeAllies) {
             if (z.isDead()) continue;
-            LivingEntity tgt = nearest(z.getLocation(), enemies);
+            LivingEntity tgt = nearest(z.getLocation(), targets);
             if (tgt == null) continue;
             double d2 = z.getLocation().distanceSquared(tgt.getLocation());
             if (d2 > 3.5) {
@@ -326,7 +535,7 @@ public class BattleManager implements Listener {
         // archers: keep ~10–18 blocks and shoot with cooldown
         for (Skeleton s : rangedAllies) {
             if (s.isDead()) continue;
-            LivingEntity tgt = nearest(s.getLocation(), enemies);
+            LivingEntity tgt = nearest(s.getLocation(), targets);
             if (tgt == null) continue;
 
             double dist = s.getLocation().distance(tgt.getLocation());
@@ -351,11 +560,51 @@ public class BattleManager implements Listener {
                 arrow.setPickupStatus(Arrow.PickupStatus.DISALLOWED);
                 arrow.setShooter(s);
 
-
                 archerCd.put(s.getUniqueId(), 30); // ~1.5s (10-tick loop)
             }
         }
     }
+
+
+    // ===== Player-issued orders =====
+    public void orderCharge() {
+        this.commandMode = CommandMode.CHARGE;
+
+        // Player infantry charge nearest bandit
+        for (Zombie z : infantry) {
+            z.setAI(true);
+            LivingEntity target = nearest(z.getLocation(), new ArrayList<>(enemyInfantry));
+            if (target != null) {
+                z.setTarget(target);
+            }
+        }
+
+        // Player archers charge nearest bandit
+        for (Skeleton s : archers) {
+            s.setAI(true);
+            LivingEntity target = nearest(s.getLocation(), new ArrayList<>(enemyInfantry));
+            if (target != null) {
+                s.setTarget(target);
+            }
+        }
+    }
+
+
+    public void orderFollow(Player p) {
+        this.commandMode = CommandMode.FOLLOW;
+        this.followTarget = p;
+
+        // Unfreeze troops so they can move again
+        infantry.forEach(m -> m.setAI(true));
+        archers.forEach(m -> m.setAI(true));
+    }
+
+    public void orderHold() {
+        this.commandMode = CommandMode.HOLD;
+        infantry.forEach(m -> m.setAI(false));
+        archers.forEach(m -> m.setAI(false));
+    }
+
 
     private LivingEntity nearest(Location from, List<LivingEntity> list) {
         double best = Double.MAX_VALUE;

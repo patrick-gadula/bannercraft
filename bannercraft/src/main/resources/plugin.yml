@@ -11,6 +11,10 @@ commands:
     usage: /battle <start|stop|follow|movehere|charge>
     permission: bannercraft.battle
     permission-message: "§cYou don't have permission to use /battle"
+  start:
+    description: Begin the battle
+    usage: /start
+    permission: bannercraft.start
   formation:
     description: Set troop formation for infantry or archers
     usage: /formation <infantry|archers> <line|shield|loose>
