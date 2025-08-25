@@ -20,3 +20,8 @@ commands:
     usage: /formation <infantry|archers> <line|shield|loose>
     permission: bannercraft.formation
     permission-message: "§cYou don't have permission to use /formation"
+  create:
+    description: Create or reset an admin battle instance
+    usage: /create battleinstance
+    permission: bannercraft.create
+    permission-message: "§cYou don't have permission to use /create"

@@ -12,6 +12,9 @@ public final class BannerCraft extends JavaPlugin {
 
         // Event listeners
         getServer().getPluginManager().registerEvents(battle, this);
+    // Admin tools
+    AdminTools admin = new AdminTools(this, battle.getArenaManager(), battle);
+    getServer().getPluginManager().registerEvents(admin, this);
         getServer().getPluginManager().registerEvents(new CommandListener(battle), this);
 
         // /battle
@@ -64,6 +67,21 @@ public final class BannerCraft extends JavaPlugin {
                 case "archers"  -> { battle.setArcherFormation(f,  p.getLocation()); p.sendMessage("§bArchers  -> " + f); }
                 default         -> p.sendMessage("§cBad group. Use infantry|archers");
             }
+            return true;
+        });
+
+        // /create battleinstance
+        getCommand("create").setExecutor((sender, command, label, args) -> {
+            if (!(sender instanceof Player p)) return true;
+            if (args.length == 0 || !"battleinstance".equalsIgnoreCase(args[0])) {
+                p.sendMessage("Usage: /create battleinstance");
+                return true;
+            }
+            // create/reset arena and give admin tools
+            battle.getArenaManager().createArena();
+            battle.getArenaManager().buildDivider();
+            admin.giveAdminHotbar(p);
+            p.sendMessage("§aBattle instance created and admin hotbar given.");
             return true;
         });
     }

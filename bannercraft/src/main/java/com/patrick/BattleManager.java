@@ -18,13 +18,20 @@ import org.bukkit.entity.Mob;
 import org.bukkit.entity.Player;
 import org.bukkit.entity.Skeleton;
 import org.bukkit.entity.Zombie;
+import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.block.Action;
+import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.metadata.FixedMetadataValue;
 
+@SuppressWarnings("deprecation")
 public class BattleManager implements Listener {
     private final BannerCraft plugin;
     private final ArenaManager arena = new ArenaManager();
+    private final FormationManager formationManager;
 
     private final List<Zombie> infantry = new ArrayList<>();
     private final List<Skeleton> archers = new ArrayList<>();
@@ -47,19 +54,98 @@ public class BattleManager implements Listener {
     private Player followTarget = null;
 
     private boolean frozen = false;
+    // scheduled task for continuous selective follow
+    private int selectiveFollowTaskId = -1;
 
     // per-skeleton shot cooldown (ticks)
     private final Map<UUID, Integer> archerCd = new HashMap<>();
 
+    // per-player troop budget (how many additional troops the player may spawn)
+    private final Map<UUID, Integer> playerTroopBudget = new HashMap<>();
+
+    // UI selection state (legacy) was previously here; now managed inline in listeners
+
     // persistent per-mob formation slot assignment (mob UUID -> slot index)
     private final Map<UUID, Integer> formationAssignments = new HashMap<>();
-
 
     // per-group reformation hold (ticks remaining) — during this, combat is paused for that group
     private int infReformTicks = 0;
     private int archReformTicks = 0;
+    // guard to ensure end-of-battle sequence runs only once
+    private boolean endScheduled = false;
 
-    public BattleManager(BannerCraft plugin) { this.plugin = plugin; }
+    public BattleManager(BannerCraft plugin) { 
+        this.plugin = plugin; 
+        this.formationManager = new FormationManager(plugin, arena);
+    // register formation command handler to move hotbar/interaction logic out of this class
+    Bukkit.getPluginManager().registerEvents(new FormationCommandHandler(plugin, this, formationManager), plugin);
+    // register admin tools
+    Bukkit.getPluginManager().registerEvents(new AdminTools(plugin, arena, this), plugin);
+    }
+
+    // Simple enum to describe admin spawn variants
+    public enum InfantryType { AXE, SWORD_SHIELD, SPEAR_SHIELD, MOUNTED_SPEAR }
+
+    /**
+     * Spawn an admin/test zombie variant at the given location. Tags the mob so selection
+     * filters work and attempts to set a default scale via configured command template.
+     */
+    public void spawnAdminZombie(Location loc, InfantryType type) {
+        if (loc == null) return;
+        Zombie z = loc.getWorld().spawn(loc, Zombie.class);
+        z.setShouldBurnInDay(false);
+        z.setRemoveWhenFarAway(false);
+        prepareMob(z);
+
+        switch (type) {
+            case AXE -> {
+                z.setCustomName("Infantry");
+                try { z.getEquipment().setItemInMainHand(new ItemStack(Material.IRON_AXE)); } catch (Throwable ignore) {}
+                z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "axeman"));
+                infantry.add(z);
+            }
+            case SWORD_SHIELD -> {
+                z.setCustomName("Infantry");
+                try { z.getEquipment().setItemInMainHand(new ItemStack(Material.IRON_SWORD)); } catch (Throwable ignore) {}
+                try { z.getEquipment().setItemInOffHand(new ItemStack(Material.SHIELD)); } catch (Throwable ignore) {}
+                z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "swordshield"));
+                infantry.add(z);
+            }
+            case SPEAR_SHIELD -> {
+                z.setCustomName("Infantry");
+                try { z.getEquipment().setItemInMainHand(new ItemStack(Material.TRIDENT)); } catch (Throwable ignore) {}
+                try { z.getEquipment().setItemInOffHand(new ItemStack(Material.SHIELD)); } catch (Throwable ignore) {}
+                z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "spearman"));
+                infantry.add(z);
+            }
+            case MOUNTED_SPEAR -> {
+                z.setCustomName("Infantry");
+                try { z.getEquipment().setItemInMainHand(new ItemStack(Material.TRIDENT)); } catch (Throwable ignore) {}
+                z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "mounted"));
+                infantry.add(z);
+                // mount a horse if available
+                try {
+                    var horse = loc.getWorld().spawn(loc.clone().add(0.5, 0, 0.5), org.bukkit.entity.Horse.class);
+                    horse.setAdult();
+                    horse.addPassenger(z);
+                } catch (Throwable ignore) {}
+            }
+        }
+
+        // Attempt to apply base scale of 0.5 via configured template or Minecraft:scale if available
+        try {
+            String template = plugin.getConfig().getString("scalingCommand");
+            String scale = plugin.getConfig().getString("scalingValue", "0.5");
+            if (template != null && !template.isBlank()) {
+                String cmd = template.replace("{target}", z.getUniqueId().toString()).replace("{scale}", scale);
+                Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
+            } else {
+                // fallback command for servers supporting Minecraft:scale
+                String cmd = String.format("minecraft:scale base set %s %s", z.getUniqueId().toString(), "0.5");
+                Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
+            }
+        } catch (Throwable ignore) {}
+    }
 
     public void startBattle(Player p) {
         if (battleRunning) { 
@@ -71,39 +157,117 @@ public class BattleManager implements Listener {
         arena.createArena();
         arena.buildDivider();
         arena.sendToArena(p);
+
+        p.getInventory().remove(Material.STICK);
         giveCommandSticks(p);
 
-        // Player in survival right away
-        p.setGameMode(GameMode.SURVIVAL);
+        // Setup: keep player in adventure/spectator-like setup with flight allowed so they can arrange
+        p.setGameMode(GameMode.ADVENTURE);
+        p.setAllowFlight(true);
+        p.setFlying(true);
 
         // spawn + anchors
         Location center = arena.getPlatformCenter();
         infAnchor  = center.clone().add(0, 0, -5);
         archAnchor = center.clone().add(0, 0, -9);
 
-        // no freeze window
-        setFrozen(false);
+        // Give player their starting troop: 1 free infantry already present
+        UUID pid = p.getUniqueId();
+        if (!playerTroopBudget.containsKey(pid)) {
+            // default budget = 0 additional troops; player still gets the free starter
+            playerTroopBudget.put(pid, 0);
+        }
+    spawnPlayerTroop(infAnchor.clone(), true);
+    formationManager.placeGroup(infantry, infAnchor, infFormation);
 
-    // Reset any previous command state so a new battle starts in NORMAL mode
-    this.commandMode = CommandMode.NORMAL;
-    this.followTarget = null;
-    this.formationAssignments.clear();
+    // Freeze troops during setup so nothing moves across the divider
+    setFrozen(true);
 
-        // just wait for /start to actually drop divider + order combat
-        p.sendMessage("§eTroops are ready. Use /start when ready to begin!");
+        // Provide an early-start item (Redstone) in hotbar slot 4
+        ItemStack early = new ItemStack(Material.REDSTONE);
+        ItemMeta earlyMeta = early.getItemMeta(); earlyMeta.setDisplayName("§cStart Battle Early"); early.setItemMeta(earlyMeta);
+        p.getInventory().setItem(4, early);
+
+        // Automatic 60s setup countdown: show titles at 60,30,10,5..1 and auto-begin
+        final int[] secondsLeft = new int[] { 60 };
+        final int[] taskHolder = new int[] { -1 };
+        taskHolder[0] = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
+            if (!battleRunning) { Bukkit.getScheduler().cancelTask(taskHolder[0]); return; }
+            int s = secondsLeft[0];
+            if (s == 60 || s == 30 || s == 10 || (s <= 5 && s >= 1)) {
+                p.sendTitle("§eSetup: " + s + "s", "Arrange your troops", 5, 20, 5);
+            }
+            if (s <= 0) {
+                Bukkit.getScheduler().cancelTask(taskHolder[0]);
+                beginCombat();
+            }
+            secondsLeft[0] = Math.max(0, secondsLeft[0] - 1);
+        }, 0L, 20L);
+
+        // Reset any previous command state so a new battle starts in NORMAL mode
+        this.commandMode = CommandMode.NORMAL;
+        this.followTarget = null;
+        this.formationAssignments.clear();
+
+    // spawn enemy troops now but keep them frozen until the barrier drops
+    spawnEnemyTroops();
+
+    // just wait for /start to actually drop divider + order combat
+    p.sendMessage("§eTroops are ready. Use /start when ready to begin!");
     }
 
     public void beginCombat() {
         if (!battleRunning) return;
         arena.removeDivider();
-        spawnEnemyTroops();
-        startCombatTicker();
-        this.commandMode = CommandMode.NORMAL;
-        this.followTarget = null;
-        Bukkit.broadcastMessage("§cThe battle has begun!");
+    // Unfreeze troops now that the barrier is down and start combat behavior
+    setFrozen(false);
+
+    // Ensure all allied mobs have AI enabled and issue an immediate move command
+    infantry.forEach(m -> { if (!m.isDead()) { m.setAI(true); } });
+    archers.forEach(m -> { if (!m.isDead()) { m.setAI(true); } });
+
+    // Trigger a short reformation burst so troops walk into their combat slots
+    infReformTicks = archReformTicks = 80; // ~4s of reforming
+    formationManager.initializeFormationAssignments(infantry, infAnchor, infFormation);
+    formationManager.moveGroupInFormation(infantry, infAnchor, infFormation);
+    formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
+    formationManager.initializeFormationAssignments(archers, archAnchor, archFormation);
+    formationManager.moveGroupInFormation(archers, archAnchor, archFormation);
+    formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
+
+    // Ensure enemy mobs have AI enabled so they can act when combat starts
+    enemyInfantry.forEach(m -> { if (!m.isDead()) m.setAI(true); });
+    enemyArchers.forEach(m -> { if (!m.isDead()) m.setAI(true); });
+
+    // Clear players' inventories for combat and give a single redstone torch (charge command)
+    for (Player pl : Bukkit.getOnlinePlayers()) {
+        pl.getInventory().clear();
+        try { pl.getInventory().setArmorContents(new ItemStack[0]); } catch (Throwable ignore) {}
+        ItemStack charge = new ItemStack(Material.REDSTONE_TORCH);
+        ItemMeta cm = charge.getItemMeta(); cm.setDisplayName("§cCharge"); charge.setItemMeta(cm);
+        pl.getInventory().setItem(4, charge);
     }
 
+        startCombatTicker();
+        // Preserve follow state if a selective follow task is active; otherwise reset
+        if (selectiveFollowTaskId != -1 && this.followTarget != null) {
+            this.commandMode = CommandMode.FOLLOW;
+        } else {
+            this.commandMode = CommandMode.NORMAL;
+            this.followTarget = null;
+        }
+        // Disable flight and ensure players are in SURVIVAL when combat actually begins
+        for (Player pl : Bukkit.getOnlinePlayers()) {
+            pl.setGameMode(GameMode.SURVIVAL);
+            pl.setAllowFlight(false);
+            pl.setFlying(false);
+        }
+    String msg = "§cThe battle has begun!";
+    Bukkit.getOnlinePlayers().forEach(pl -> pl.sendMessage(msg));
 
+        // Attempt to scale players and mobs via configured attribute command if present
+        tryApplyScaling();
+    }
 
     public void stopBattle() {
         battleRunning = false;
@@ -120,12 +284,15 @@ public class BattleManager implements Listener {
         archerCd.clear();
         infReformTicks = archReformTicks = 0;
 
-        // remove command sticks and sweep only our named battle mobs across all worlds
+        // remove command tools and sweep only our named battle mobs across all worlds
         for (Player pl : Bukkit.getOnlinePlayers()) {
-            pl.getInventory().remove(Material.STICK);
-            pl.getInventory().remove(Material.REDSTONE_TORCH);
             pl.getInventory().remove(Material.LIME_DYE);
-            pl.getInventory().remove(Material.GRAY_DYE);
+            pl.getInventory().remove(Material.IRON_SWORD);
+            pl.getInventory().remove(Material.BOW);
+            pl.getInventory().remove(Material.SADDLE);
+            pl.getInventory().remove(Material.IRON_AXE);
+            pl.getInventory().remove(Material.ARROW);
+            pl.getInventory().remove(Material.REDSTONE_TORCH);
             arena.sendBack(pl);
         }
 
@@ -142,32 +309,132 @@ public class BattleManager implements Listener {
         }
     }
 
-    private void giveCommandSticks(Player p) {
-        ItemStack spawnTool = new ItemStack(Material.STICK);
-        ItemMeta st = spawnTool.getItemMeta(); st.setDisplayName("§eTroop Spawner"); spawnTool.setItemMeta(st);
+    public void giveCommandSticks(Player p) {
+        // Primary formation selectors placed in hotbar slots 0..3
+        p.getInventory().clear();
 
-        ItemStack torch = new ItemStack(Material.REDSTONE_TORCH);
-        ItemMeta tm = torch.getItemMeta(); tm.setDisplayName("§cCharge!"); torch.setItemMeta(tm);
+        ItemStack everyone = new ItemStack(Material.LIME_DYE);
+        ItemMeta em = everyone.getItemMeta(); em.setDisplayName("§aEveryone!"); everyone.setItemMeta(em);
 
-        ItemStack lime = new ItemStack(Material.LIME_DYE);
-        ItemMeta lm = lime.getItemMeta(); lm.setDisplayName("§aFollow Me!"); lime.setItemMeta(lm);
+        ItemStack vanguard = new ItemStack(Material.IRON_SWORD);
+        ItemMeta vm = vanguard.getItemMeta(); vm.setDisplayName("§7Vanguard"); vanguard.setItemMeta(vm);
 
-        ItemStack hold = new ItemStack(Material.GRAY_DYE);
-        ItemMeta hm = hold.getItemMeta(); hm.setDisplayName("§7Hold Position!"); hold.setItemMeta(hm);
+        ItemStack arch = new ItemStack(Material.BOW);
+        ItemMeta am = arch.getItemMeta(); am.setDisplayName("§bArchers"); arch.setItemMeta(am);
 
-        p.getInventory().addItem(spawnTool, torch, lime, hold);
+        ItemStack calv = new ItemStack(Material.SADDLE);
+        ItemMeta cm = calv.getItemMeta(); cm.setDisplayName("§6Calvary"); calv.setItemMeta(cm);
+
+    p.getInventory().setItem(0, everyone);
+    p.getInventory().setItem(1, vanguard);
+    p.getInventory().setItem(2, arch);
+    p.getInventory().setItem(3, calv);
+    }
+
+    /**
+     * Attempt to spawn a troop for the player; respects per-player budget.
+     * If budget is zero, only allow the free starter that was already given in startBattle.
+     */
+    public boolean spawnPlayerTroopFor(Player p, Location loc, boolean infantryType) {
+        UUID pid = p.getUniqueId();
+        int budget = playerTroopBudget.getOrDefault(pid, 0);
+        if (budget <= 0) {
+            p.sendMessage("§cNo troop budget remaining. Buy troops to spawn more.");
+            return false;
+        }
+        // decrement budget and spawn
+        playerTroopBudget.put(pid, budget - 1);
+        spawnPlayerTroop(loc, infantryType);
+        return true;
+    }
+
+    // Only open secondary hotbar when player actually interacts (right-click) with a primary item.
+    @EventHandler
+    public void onPlayerInteract(PlayerInteractEvent ev) {
+        if (!battleRunning) return;
+        if (ev.getAction() != Action.RIGHT_CLICK_AIR && ev.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        Player p = ev.getPlayer();
+        ItemStack inHand = p.getInventory().getItemInMainHand();
+        if (inHand == null) return;
+        Material m = inHand.getType();
+
+        // Early-start hotbar item (redstone) during setup
+        if (m == Material.REDSTONE) {
+            ev.setCancelled(true);
+            if (combatTaskId == -1) beginCombat();
+            return;
+        }
+
+        // Charge torch during combat: right-click to order charge
+        if (m == Material.REDSTONE_TORCH) {
+            ev.setCancelled(true);
+            // only meaningful during combat
+            if (combatTaskId != -1 && battleRunning) {
+                orderCharge();
+                p.sendMessage("§cCharge order given!");
+                // remove torch from slot 4 to avoid repeated use
+                p.getInventory().setItem(4, null);
+            }
+            return;
+        }
+
+        // Primaries are handled by FormationCommandHandler; ignore here to avoid double-handling.
+        if (m == Material.LIME_DYE || m == Material.IRON_SWORD || m == Material.BOW || m == Material.SADDLE) {
+            ev.setCancelled(true);
+            return;
+        }
+
+        // If player clicks Back, restore primaries
+        if (m == Material.GRAY_DYE) {
+            ev.setCancelled(true);
+            giveCommandSticks(p);
+        }
+    }
+
+    // Inventory and drop handling moved to FormationCommandHandler to centralize UI logic.
+
+    // NOTE: scaling players and mobs to 0.5 is not supported directly via the Bukkit API.
+    // Native entity/player scaling requires server-specific features or client-side resource packs.
+    // Alternatives:
+    //  - Spawn 'baby' variants where available (Zombie#setBaby(true)) to approximate smaller mobs.
+    //  - Use a third-party plugin (e.g. LibsDisguises or an entity-scaling plugin) or Paper API if available.
+    // If you want, I can implement baby-zombies for infantry and keep archers as standard, or add hooks
+    // for an external scaling plugin.
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent ev) {
+        // cleanup budget state
+        playerTroopBudget.remove(ev.getPlayer().getUniqueId());
+        // if the quitting player was the follow target, cancel selective follow
+        try {
+            if (followTarget != null && ev.getPlayer().getUniqueId().equals(followTarget.getUniqueId())) {
+                followTarget = null;
+                if (selectiveFollowTaskId != -1) {
+                    Bukkit.getScheduler().cancelTask(selectiveFollowTaskId);
+                    selectiveFollowTaskId = -1;
+                }
+                this.commandMode = CommandMode.NORMAL;
+            }
+        } catch (Throwable ignore) {}
     }
 
     public void spawnPlayerTroop(Location loc, boolean infantryType) {
         if (infantryType) {
             Zombie z = loc.getWorld().spawn(loc, Zombie.class);
-            z.setCustomName("Infantry");
+            z.setCustomName("Axeman");
+            try { z.setCustomNameVisible(true); } catch (Throwable ignore) {}
+            try { z.getEquipment().setItemInMainHand(new ItemStack(Material.IRON_AXE)); } catch (Throwable ignore) {}
+            // tag entity with subclass metadata for robust selection
+            try { z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "axeman")); } catch (Throwable ignore) {}
             z.setShouldBurnInDay(false);
+            // Use baby zombies to approximate 0.5 scale where supported
+            try { z.setBaby(true); } catch (NoSuchMethodError ignore) {}
             prepareMob(z);
             infantry.add(z);
         } else {
             Skeleton s = loc.getWorld().spawn(loc, Skeleton.class);
             s.setCustomName("Archer");
+            try { s.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "archer")); } catch (Throwable ignore) {}
             s.setShouldBurnInDay(false);
             prepareMob(s);
             archers.add(s);
@@ -181,14 +448,18 @@ public class BattleManager implements Listener {
             Zombie bandit = center.getWorld().spawn(center.clone().add(i, 0, 2), Zombie.class);
             bandit.setCustomName("Bandit");
             bandit.setShouldBurnInDay(false);
+            try { bandit.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "bandit")); } catch (Throwable ignore) {}
             prepareMob(bandit);
 
             // Equip sword
             bandit.getEquipment().setItemInMainHand(new ItemStack(Material.IRON_SWORD));
 
             // Buff health
-            bandit.getAttribute(Attribute.MAX_HEALTH).setBaseValue(30.0);
-            bandit.setHealth(30.0);
+            try { if (bandit.getAttribute(Attribute.MAX_HEALTH) != null) bandit.getAttribute(Attribute.MAX_HEALTH).setBaseValue(30.0); } catch (Exception ignore) {}
+            try { bandit.setHealth(30.0); } catch (Exception ignore) {}
+
+            // spawn as baby to approximate smaller scale
+            try { bandit.setBaby(true); } catch (NoSuchMethodError ignore) {}
 
             enemyInfantry.add(bandit);
         }
@@ -213,16 +484,6 @@ public class BattleManager implements Listener {
     }
 
 
-    // only used during setup if you decide to preview walking, not used in combat
-    private void startFormationTicker() {
-        stopFormationTicker();
-        formationTaskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
-            if (!battleRunning) return;
-            moveGroupInFormation(infantry, infAnchor, infFormation);
-            moveGroupInFormation(archers,  archAnchor, archFormation);
-        }, 10L, 10L);
-    }
-
     private void stopFormationTicker() {
         if (formationTaskId != -1) {
             Bukkit.getScheduler().cancelTask(formationTaskId);
@@ -240,11 +501,11 @@ public class BattleManager implements Listener {
             boolean archReforming = archReformTicks > 0;
 
             if (infReforming) {
-                moveGroupInFormation(infantry, infAnchor, infFormation);
+                formationManager.moveGroupInFormation(infantry, infAnchor, infFormation);
                 infReformTicks = Math.max(0, infReformTicks - 10);
             }
             if (archReforming) {
-                moveGroupInFormation(archers, archAnchor, archFormation);
+                formationManager.moveGroupInFormation(archers, archAnchor, archFormation);
                 archReformTicks = Math.max(0, archReformTicks - 10);
             }
 
@@ -253,8 +514,8 @@ public class BattleManager implements Listener {
                 if (commandMode == CommandMode.HOLD) {
                     // do nothing – troops stay in place
                 } else if (commandMode == CommandMode.FOLLOW && followTarget != null) {
-                    moveGroupInFormation(infantry, followTarget.getLocation().add(0, 0, 2), infFormation);
-                    moveGroupInFormation(archers,  followTarget.getLocation().add(0, 0, -2), archFormation);
+                    formationManager.moveGroupInFormation(infantry, followTarget.getLocation().add(0, 0, 2), infFormation);
+                    formationManager.moveGroupInFormation(archers,  followTarget.getLocation().add(0, 0, -2), archFormation);
                 } else if (commandMode == CommandMode.CHARGE) {
                     // charge = actively target enemies
                     List<LivingEntity> enemyTargets = new ArrayList<>();
@@ -284,231 +545,148 @@ public class BattleManager implements Listener {
         }
     }
 
-    // snap placement (teleport) — only for initial setup
-    private <T extends LivingEntity> void placeGroup(List<T> troops, Location anchor, Formation f) {
-        var offsets = f.getOffsets(troops.size());
-        for (int i = 0; i < troops.size(); i++) {
-            Location target = anchor.clone().add(offsets.get(i));
-
-            // snap X/Z to block center so placement is exact
-            target.setX(Math.floor(target.getX()) + 0.5);
-            target.setZ(Math.floor(target.getZ()) + 0.5);
-
-            // Face the enemy side center instead of hardcoding north
-            Location enemyCenter = arena.getEnemySideCenter();
-            target.setDirection(enemyCenter.toVector().subtract(target.toVector()));
-
-            troops.get(i).teleport(target);
-        }
-    }
-
-
-    // gentle walking to slots (call once when reforming)
-    private <T extends Mob> void moveGroupInFormation(List<T> troops, Location anchor, Formation f) {
-        var offsets = f.getOffsets(troops.size());
-
-        // Build concrete slot locations from offsets
-        List<Location> slots = new ArrayList<>();
-        for (int i = 0; i < offsets.size(); i++) {
-            slots.add(anchor.clone().add(offsets.get(i)));
-        }
-
-        // Also build centered-slot locations (snap X/Z to block center) so mobs line up exactly
-        List<Location> centeredSlots = new ArrayList<>();
-        for (Location s : slots) {
-            Location c = s.clone();
-            c.setX(Math.floor(c.getX()) + 0.5);
-            c.setZ(Math.floor(c.getZ()) + 0.5);
-            centeredSlots.add(c);
-        }
-
-        // Collect available (alive) mobs
-        List<T> available = new ArrayList<>();
-        for (T m : troops) if (!m.isDead()) available.add(m);
-
-    // Greedy assignment with stability: prefer previously assigned slot for each mob
-        Map<T, Location> assignment = new HashMap<>();
-        // Track which slots are taken
-    boolean[] slotTaken = new boolean[centeredSlots.size()];
-
-        // First, try to reapply previous assignments (stable slot index to same mob UUID)
-        for (T m : troops) {
-            if (m.isDead()) continue;
-            Integer idx = formationAssignments.get(m.getUniqueId());
-            if (idx != null && idx >= 0 && idx < centeredSlots.size() && !slotTaken[idx]) {
-                assignment.put(m, centeredSlots.get(idx));
-                slotTaken[idx] = true;
-                available.remove(m);
-            }
-        }
-
-        // Then greedily fill remaining slots with nearest remaining mobs
-        for (int i = 0; i < centeredSlots.size(); i++) {
-            if (slotTaken[i]) continue;
-            Location slot = centeredSlots.get(i);
-            T best = null;
-            double bestDist = Double.MAX_VALUE;
-            for (T m : available) {
-                double d = m.getLocation().distanceSquared(slot);
-                if (d < bestDist) { bestDist = d; best = m; }
-            }
-            if (best != null) {
-                assignment.put(best, slot);
-                formationAssignments.put(best.getUniqueId(), i);
-                available.remove(best);
-                slotTaken[i] = true;
-            }
-        }
-
-        // Move assigned mobs toward their unique slots and orient them
-        Location enemyCenter = arena.getEnemySideCenter();
-        for (Map.Entry<T, Location> e : assignment.entrySet()) {
-            T mob = e.getKey();
-            Location slot = e.getValue();
-
-            double distSq = mob.getLocation().distanceSquared(slot);
-            // If we're pretty close to the centered slot, snap exactly to it and set facing
-            if (distSq <= 0.9) {
-                // make a copy to set direction toward enemy center
-                Location snap = slot.clone();
-                snap.setDirection(enemyCenter.toVector().subtract(snap.toVector()));
-                mob.teleport(snap);
-                // clear velocity so they don't slide after teleport
-                mob.setVelocity(new org.bukkit.util.Vector(0, 0, 0));
-                mob.setTarget(null);
-            } else {
-                mob.getPathfinder().moveTo(slot, 1.05D);
-                mob.setTarget(null);
-
-                // While moving, keep them roughly oriented toward the enemy
-                mob.teleport(mob.getLocation().setDirection(
-                    enemyCenter.toVector().subtract(mob.getLocation().toVector())
-                ));
-            }
-        }
-}
-
-    // ===== Formation setters (do NOT anchor to player; use current centroid) =====
+    // Formation logic moved into FormationManager to keep this class focused.
     public void setInfantryFormation(Formation f, Location ignored) {
         this.infFormation = f;
-        this.infAnchor = centroid(infantry);
-        if (frozen) {
+    // if caller provided a specific anchor location, use it; otherwise compute centroid
+    if (ignored != null) this.infAnchor = ignored;
+    else this.infAnchor = formationManager.centroid(infantry);
+    if (frozen) {
             // during setup: snap instantly so the player sees the change
-            placeGroup(infantry, infAnchor, infFormation);
+            formationManager.placeGroup(infantry, infAnchor, infFormation);
             infReformTicks = 0;
         } else {
             // mid-battle: walk into the new shape and pause their combat briefly
             infReformTicks = 80; // ~4s
             // preassign slots deterministically so the first move call is stable
-            initializeFormationAssignments(infantry, infAnchor, infFormation);
+            formationManager.initializeFormationAssignments(infantry, infAnchor, infFormation);
             // run a short burst of movement+snap checks so they settle on first command
-            scheduleFormationBurst(infantry, infAnchor, infFormation);
+            formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
         }
+    }
+
+    /**
+     * Set the infantry formation state without issuing movement commands.
+     * Useful for Hold commands where troops should keep their current positions.
+     */
+    public void setInfantryFormationPassive(Formation f) {
+        this.infFormation = f;
     }
 
     public void setArcherFormation(Formation f, Location ignored) {
         this.archFormation = f;
-        this.archAnchor = centroid(archers);
+    if (ignored != null) this.archAnchor = ignored;
+    else this.archAnchor = formationManager.centroid(archers);
         if (frozen) {
-            placeGroup(archers, archAnchor, archFormation);
+            formationManager.placeGroup(archers, archAnchor, archFormation);
             archReformTicks = 0;
         } else {
             archReformTicks = 80;
             // preassign slots deterministically so the first move call is stable
-            initializeFormationAssignments(archers, archAnchor, archFormation);
-            scheduleFormationBurst(archers, archAnchor, archFormation);
+            formationManager.initializeFormationAssignments(archers, archAnchor, archFormation);
+            formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
         }
     }
 
-    // Call moveGroupInFormation several times over a short period so mobs finish
-    // their pathing approach and snap without requiring the user to re-run the command.
-    private <T extends Mob> void scheduleFormationBurst(List<T> troops, Location anchor, Formation f) {
-        // First call immediately so they start moving toward slots.
-        moveGroupInFormation(troops, anchor, f);
+    /**
+     * Set the archer formation state without issuing movement commands.
+     */
+    public void setArcherFormationPassive(Formation f) {
+        this.archFormation = f;
+    }
 
-        // Then run a periodic check: if a sufficient fraction of troops are within
-        // the snap radius of their assigned slot, perform the final snap. Timeout
-        // after ~6 seconds (120 ticks) to avoid never completing.
-        final int[] ticks = new int[] { 0 };
-        final int[] holder = new int[1];
+    /**
+     * Apply a formation to a selected subset of troops. If the battle is in setup
+     * (frozen) the formation will snap into place; otherwise troops will be
+     * asked to walk into formation and a short movement burst will be scheduled.
+     *
+     * @param playerId player who issued the command (currently unused but kept for future)
+     * @param subclassTag "axeman", "spearman" or null to select all
+     * @param includeInfantry whether infantry should be targeted
+     * @param includeArchers whether archers should be targeted
+     * @param formation desired formation
+     * @param anchor formation anchor location (if null, arena center is used)
+     */
+    public void applyFormationToSelection(java.util.UUID playerId, String subclassTag, boolean includeInfantry, boolean includeArchers, Formation formation, Location anchor) {
+        if (anchor == null) anchor = arena.getPlatformCenter();
 
-        // precompute centered slots from formation offsets
-        var offsets = f.getOffsets(troops.size());
-        List<Location> centeredSlots = new ArrayList<>();
-        for (int i = 0; i < offsets.size(); i++) {
-            Location s = anchor.clone().add(offsets.get(i));
-            s.setX(Math.floor(s.getX()) + 0.5);
-            s.setZ(Math.floor(s.getZ()) + 0.5);
-            centeredSlots.add(s);
+        if (includeInfantry) {
+            List<Zombie> targets = new ArrayList<>();
+            for (Zombie z : infantry) {
+                if (z.isDead()) continue;
+                if (subclassTag == null || subclassTag.isEmpty() || hasTag(z, subclassTag)) targets.add(z);
+            }
+            if (!targets.isEmpty()) {
+                if (frozen) {
+                    // snap into place during setup
+                    formationManager.placeGroup(targets, anchor, formation);
+                } else {
+                    formationManager.initializeFormationAssignments(targets, anchor, formation);
+                    formationManager.moveGroupInFormation(targets, anchor, formation);
+                    formationManager.scheduleFormationBurst(targets, anchor, formation);
+                }
+            }
         }
 
-        holder[0] = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
-            if (!battleRunning) {
-                Bukkit.getScheduler().cancelTask(holder[0]);
-                return;
+        if (includeArchers) {
+            List<Skeleton> targets = new ArrayList<>();
+            for (Skeleton s : archers) {
+                if (s.isDead()) continue;
+                if (subclassTag == null || subclassTag.isEmpty() || hasTag(s, subclassTag)) targets.add(s);
             }
-            ticks[0] += 10;
-
-            // Count troops close to their assigned centered slot
-            int close = 0, total = 0;
-            for (T m : troops) {
-                if (m.isDead()) continue;
-                total++;
-                Integer idx = formationAssignments.get(m.getUniqueId());
-                if (idx == null || idx < 0 || idx >= centeredSlots.size()) continue;
-                Location slot = centeredSlots.get(idx);
-                double d2 = m.getLocation().distanceSquared(slot);
-                if (d2 <= 1.2) close++; // ~1.1 blocks squared threshold
+            if (!targets.isEmpty()) {
+                if (frozen) {
+                    formationManager.placeGroup(targets, anchor, formation);
+                } else {
+                    formationManager.initializeFormationAssignments(targets, anchor, formation);
+                    formationManager.moveGroupInFormation(targets, anchor, formation);
+                    formationManager.scheduleFormationBurst(targets, anchor, formation);
+                }
             }
-
-            // condition: at least 70% are close, or timeout reached
-            if (total > 0 && (close * 100 / total >= 70 || ticks[0] >= 120)) {
-                moveGroupInFormation(troops, anchor, f);
-                Bukkit.getScheduler().cancelTask(holder[0]);
-            }
-        }, 10L, 10L);
+        }
     }
+
+    // formation bursts delegated to FormationManager
 
     // Deterministically assign each alive troop to a centered slot so the first reform
     // tick will already have stable assignments and snap behavior.
-    private <T extends Mob> void initializeFormationAssignments(List<T> troops, Location anchor, Formation f) {
-        var offsets = f.getOffsets(troops.size());
-        List<Location> centeredSlots = new ArrayList<>();
-        for (int i = 0; i < offsets.size(); i++) {
-            Location s = anchor.clone().add(offsets.get(i));
-            s.setX(Math.floor(s.getX()) + 0.5);
-            s.setZ(Math.floor(s.getZ()) + 0.5);
-            centeredSlots.add(s);
+    // initialization delegated to FormationManager
+
+    // centroid delegated to FormationManager
+
+    // Attempt to scale players and mobs using a configurable server command template
+    // The plugin config may provide a `scalingCommand` such as:
+    //   attribute scale set {target} {scale}
+    // where {target} and {scale} are placeholders. This method dispatches that
+    // command for each online player and for any named battle mobs (UUID is used
+    // as the default mob placeholder). If no template is configured, this is a no-op.
+    private void tryApplyScaling() {
+        String template = plugin.getConfig().getString("scalingCommand");
+        if (template == null || template.isBlank()) return;
+        String scale = plugin.getConfig().getString("scalingValue", "0.5");
+
+        // Scale players
+        for (Player pl : Bukkit.getOnlinePlayers()) {
+            String cmd = template.replace("{target}", pl.getName()).replace("{scale}", scale);
+            Bukkit.getLogger().info(String.format("Dispatching scaling command: %s", cmd));
+            Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
         }
 
-        List<T> available = new ArrayList<>();
-        for (T m : troops) if (!m.isDead()) available.add(m);
-
-        // Greedy: for each slot, pick the nearest available mob and record its slot index
-        for (int i = 0; i < centeredSlots.size() && !available.isEmpty(); i++) {
-            Location slot = centeredSlots.get(i);
-            T best = null; double bestDist = Double.MAX_VALUE;
-            for (T m : available) {
-                double d = m.getLocation().distanceSquared(slot);
-                if (d < bestDist) { bestDist = d; best = m; }
+        // Scale named battle mobs (replace {target} with the entity UUID)
+        for (World w : Bukkit.getWorlds()) {
+            for (org.bukkit.entity.Entity ent : w.getEntities()) {
+                if (ent instanceof LivingEntity) {
+                    String n = ent.getCustomName();
+                    if ("Infantry".equals(n) || "Archer".equals(n)
+                            || "Enemy Infantry".equals(n) || "Enemy Archer".equals(n)) {
+                        String target = ent.getUniqueId().toString();
+                        String cmd = template.replace("{target}", target).replace("{scale}", scale);
+                        Bukkit.getLogger().info(String.format("Dispatching scaling command for mob: %s", cmd));
+                        Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
+                    }
+                }
             }
-            if (best != null) {
-                formationAssignments.put(best.getUniqueId(), i);
-                available.remove(best);
-            }
         }
-    }
-
-    private Location centroid(List<? extends LivingEntity> list) {
-        if (list.isEmpty()) return arena.getPlatformCenter();
-        World w = list.get(0).getWorld();
-        double sx = 0, sy = 0, sz = 0;
-        for (LivingEntity e : list) {
-            Location l = e.getLocation();
-            sx += l.getX(); sy += l.getY(); sz += l.getZ();
-        }
-        int n = list.size();
-        return new Location(w, sx / n, sy / n, sz / n);
     }
 
     // ===== Simple auto-combat (melee hits + archer kiting & shots) =====
@@ -569,6 +747,12 @@ public class BattleManager implements Listener {
     // ===== Player-issued orders =====
     public void orderCharge() {
         this.commandMode = CommandMode.CHARGE;
+        // If a selective follow is active, cancel it so troops stop following the player
+        if (selectiveFollowTaskId != -1) {
+            try { Bukkit.getScheduler().cancelTask(selectiveFollowTaskId); } catch (Throwable ignore) {}
+            selectiveFollowTaskId = -1;
+        }
+        this.followTarget = null;
 
         // Player infantry charge nearest bandit
         for (Zombie z : infantry) {
@@ -587,6 +771,9 @@ public class BattleManager implements Listener {
                 s.setTarget(target);
             }
         }
+    // quick formation movement so troops visibly surge forward when charged
+    formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
+    formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
     }
 
 
@@ -597,12 +784,107 @@ public class BattleManager implements Listener {
         // Unfreeze troops so they can move again
         infantry.forEach(m -> m.setAI(true));
         archers.forEach(m -> m.setAI(true));
-    }
+        // immediately move groups to positions around the player so the reaction is visible
+        formationManager.initializeFormationAssignments(infantry, p.getLocation().add(0, 0, 2), infFormation);
+        formationManager.moveGroupInFormation(infantry, p.getLocation().add(0, 0, 2), infFormation);
+        formationManager.scheduleFormationBurst(infantry, p.getLocation().add(0, 0, 2), infFormation);
+        formationManager.initializeFormationAssignments(archers, p.getLocation().add(0, 0, -2), archFormation);
+        formationManager.moveGroupInFormation(archers, p.getLocation().add(0, 0, -2), archFormation);
+        formationManager.scheduleFormationBurst(archers, p.getLocation().add(0, 0, -2), archFormation);
+        }
 
     public void orderHold() {
         this.commandMode = CommandMode.HOLD;
         infantry.forEach(m -> m.setAI(false));
         archers.forEach(m -> m.setAI(false));
+    }
+
+    // Selective orders that apply only to troops with matching metadata tag.
+    public void followSelection(Player p, String subclassTag, boolean includeArchers) {
+        this.commandMode = CommandMode.FOLLOW;
+        this.followTarget = p;
+
+        // cancel any previous selective follow task
+        if (selectiveFollowTaskId != -1) {
+            Bukkit.getScheduler().cancelTask(selectiveFollowTaskId);
+            selectiveFollowTaskId = -1;
+        }
+
+        // unfreeze targeted mobs so they can move
+        infantry.forEach(m -> {
+            try { if (hasTag(m, subclassTag)) m.setAI(true); } catch (Throwable ignore) {}
+        });
+        if (includeArchers) {
+            archers.forEach(s -> {
+                try { if (hasTag(s, subclassTag)) s.setAI(true); } catch (Throwable ignore) {}
+            });
+        }
+
+        // schedule a repeating follow task that updates selective groups frequently
+        selectiveFollowTaskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
+            if (!battleRunning || followTarget == null) {
+                if (selectiveFollowTaskId != -1) {
+                    Bukkit.getScheduler().cancelTask(selectiveFollowTaskId);
+                    selectiveFollowTaskId = -1;
+                }
+                return;
+            }
+
+            Location anchor = followTarget.getLocation();
+            formationManager.moveGroupInFormation(infantry.stream().filter(m -> !m.isDead() && hasTag(m, subclassTag)).toList(), anchor.clone().add(0, 0, 2), infFormation);
+            if (includeArchers) formationManager.moveGroupInFormation(archers.stream().filter(s -> !s.isDead() && hasTag(s, subclassTag)).toList(), anchor.clone().add(0, 0, -2), archFormation);
+        }, 0L, 10L);
+    }
+
+    public void holdSelection(String subclassTag, boolean includeArchers) {
+        this.commandMode = CommandMode.HOLD;
+        // disable AI only for matching troops
+        infantry.forEach(m -> {
+            try { if (hasTag(m, subclassTag)) m.setAI(false); } catch (Throwable ignore) {}
+        });
+        if (includeArchers) archers.forEach(s -> {
+            try { if (hasTag(s, subclassTag)) s.setAI(false); } catch (Throwable ignore) {}
+        });
+    }
+
+    public void chargeSelection(String subclassTag, boolean includeArchers) {
+        this.commandMode = CommandMode.CHARGE;
+        if (selectiveFollowTaskId != -1) {
+            try { Bukkit.getScheduler().cancelTask(selectiveFollowTaskId); } catch (Throwable ignore) {}
+            selectiveFollowTaskId = -1;
+        }
+        this.followTarget = null;
+        // targeted charge: set targets only for matching troops
+        for (Zombie z : infantry) {
+            try {
+                if (!hasTag(z, subclassTag)) continue;
+                z.setAI(true);
+                LivingEntity target = nearest(z.getLocation(), new ArrayList<>(enemyInfantry));
+                if (target != null) z.setTarget(target);
+            } catch (Throwable ignore) {}
+        }
+        if (includeArchers) for (Skeleton s : archers) {
+            try {
+                if (!hasTag(s, subclassTag)) continue;
+                s.setAI(true);
+                LivingEntity target = nearest(s.getLocation(), new ArrayList<>(enemyInfantry));
+                if (target != null) s.setTarget(target);
+            } catch (Throwable ignore) {}
+        }
+        formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
+        formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
+    }
+
+    private boolean hasTag(org.bukkit.entity.Entity e, String tag) {
+    if (e == null) return false;
+    // empty or null tag means match all
+    if (tag == null || tag.isEmpty()) return true;
+        try {
+            if (e.hasMetadata("troop_subclass")) {
+                return e.getMetadata("troop_subclass").stream().anyMatch(md -> tag.equalsIgnoreCase(md.asString()));
+            }
+        } catch (Throwable ignore) {}
+        return false;
     }
 
 
@@ -641,12 +923,34 @@ public class BattleManager implements Listener {
                 || archers.stream().anyMatch(e -> !e.isDead());
 
         if (!enemiesAlive || !alliesAlive) {
-            Bukkit.broadcastMessage(!enemiesAlive ? "§aYou won!" : "§cYou lost!");
-            stopBattle();
+            if (!endScheduled) {
+                endScheduled = true;
+                String winnerMsg = !enemiesAlive ? "§aYou won!" : "§cYou lost!";
+                Bukkit.getOnlinePlayers().forEach(pl -> pl.sendTitle(winnerMsg, "Returning in 10s...", 5, 40, 5));
+                // delay actual stop to allow celebration / rewards
+                Bukkit.getScheduler().scheduleSyncDelayedTask(plugin, () -> stopBattle(), 20L * 10);
+            }
+        }
+    }
+
+    @EventHandler
+    public void onArenaMobDeath(org.bukkit.event.entity.EntityDeathEvent ev) {
+        org.bukkit.entity.Entity ent = ev.getEntity();
+        if (ent instanceof Zombie || ent instanceof Skeleton) {
+            String n = ent.getCustomName();
+            if ("Infantry".equals(n) || "Archer".equals(n)
+                    || "Enemy Infantry".equals(n) || "Enemy Archer".equals(n) || "Bandit".equals(n)) {
+                ev.getDrops().clear();
+                ev.setDroppedExp(0);
+            }
         }
     }
 
     public List<Zombie> getInfantry() { return infantry; }
     public List<Skeleton> getArchers() { return archers; }
     public boolean isBattleRunning() { return battleRunning; }
+    /** Returns true when combat (the repeating combat ticker) is active */
+    public boolean isCombatRunning() { return combatTaskId != -1; }
+
+    public ArenaManager getArenaManager() { return this.arena; }
 }
