@@ -25,3 +25,8 @@ commands:
     usage: /create battleinstance
     permission: bannercraft.create
     permission-message: "§cYou don't have permission to use /create"
+  adminhotbar:
+    description: Give admin spawn hotbar
+    usage: /adminhotbar
+    permission: bannercraft.admin
+    permission-message: "§cYou don't have permission to use /adminhotbar"

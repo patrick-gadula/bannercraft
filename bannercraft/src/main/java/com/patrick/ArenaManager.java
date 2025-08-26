@@ -87,6 +87,11 @@ public class ArenaManager {
         return new Location(arenaWorld, 0.5, PLATFORM_Y + 1, 20.5);
     }
 
+    public boolean isArenaWorld(World w) {
+        if (w == null) return false;
+        return arenaWorld != null && w.getName().equals(arenaWorld.getName());
+    }
+
     public void sendToArena(Player p) {
     UUID id = p.getUniqueId();
     // save player's current location so we can restore later

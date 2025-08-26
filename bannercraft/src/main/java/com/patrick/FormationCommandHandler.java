@@ -18,6 +18,7 @@ import org.bukkit.inventory.meta.ItemMeta;
 
 public class FormationCommandHandler implements Listener {
     private final BattleManager battle;
+    private final BannerCraft plugin;
 
     private enum Primary { EVERYONE, INFANTRY, ARCHERS, CALVARY }
     private enum Subclass { NONE, AXEMAN, SPEARMAN }
@@ -27,6 +28,7 @@ public class FormationCommandHandler implements Listener {
 
     public FormationCommandHandler(BannerCraft plugin, BattleManager battle, FormationManager fm) {
         this.battle = battle;
+        this.plugin = plugin;
     }
 
     private void restorePrimaries(Player p) {
@@ -55,9 +57,9 @@ public class FormationCommandHandler implements Listener {
         UUID id = p.getUniqueId();
         Primary pri = selectedPrimary.getOrDefault(id, Primary.EVERYONE);
 
-        // If the selected primary is ARCHERS or CALVARY we don't offer infantry subclasses.
-        // Jump straight to actions in that case.
-        if (pri == Primary.ARCHERS || pri == Primary.CALVARY) {
+    // If the selected primary is ARCHERS, CALVARY, or EVERYONE we don't offer infantry subclasses.
+    // Jump straight to actions in that case.
+    if (pri == Primary.ARCHERS || pri == Primary.CALVARY || pri == Primary.EVERYONE) {
             selectedSubclass.put(id, Subclass.NONE);
             giveActions(p);
             return;
@@ -108,9 +110,10 @@ public class FormationCommandHandler implements Listener {
 
     @EventHandler
     public void onPlayerInteract(PlayerInteractEvent ev) {
-        if (!battle.isBattleRunning()) return;
-        if (ev.getAction() != Action.RIGHT_CLICK_AIR && ev.getAction() != Action.RIGHT_CLICK_BLOCK) return;
+        // allow formation interactions either during a running battle or when inside an admin-created arena
         Player p = ev.getPlayer();
+        if (!battle.isBattleRunning() && !battle.getArenaManager().isArenaWorld(p.getWorld())) return;
+        if (ev.getAction() != Action.RIGHT_CLICK_AIR && ev.getAction() != Action.RIGHT_CLICK_BLOCK) return;
         ItemStack inHand = p.getInventory().getItemInMainHand();
         if (inHand == null) return;
         Material m = inHand.getType();
@@ -177,20 +180,19 @@ public class FormationCommandHandler implements Listener {
             if (includeInfantry) {
                 // set infantry to shield wall and place them around the player
                 // require the player selected infantry primary and a subclass first
-                Primary priSel = selectedPrimary.getOrDefault(id, Primary.EVERYONE);
-                Subclass subSel = selectedSubclass.getOrDefault(id, Subclass.NONE);
-                if (priSel != Primary.INFANTRY && priSel != Primary.EVERYONE) {
-                    p.sendMessage("§cSelect Infantry primary before issuing this action.");
-                    return;
-                }
-                if (subSel == Subclass.NONE) {
-                    p.sendMessage("§cSelect a subclass (Axeman/Spearman) first.");
-                    return;
-                }
-                    // set formation state but don't move troops to the player's location
-                    battle.setInfantryFormationPassive(com.patrick.Formation.SHIELD_WALL);
-                    // hold only matching subclass (stop AI so they remain where they are)
-                    battle.holdSelection(tag, includeArchers && subSel != Subclass.NONE);
+                        Primary priSel = selectedPrimary.getOrDefault(id, Primary.EVERYONE);
+                        Subclass subSel = selectedSubclass.getOrDefault(id, Subclass.NONE);
+                        // Everyone includes infantry and archers; if the player selected Everyone and no subclass,
+                        // treat the subclass as 'match all' and allow the action.
+                        if (priSel != Primary.INFANTRY && priSel != Primary.EVERYONE) {
+                            p.sendMessage("§cSelect Infantry primary before issuing this action.");
+                            return;
+                        }
+                        // set formation state but don't move troops to the player's location
+                        battle.setInfantryFormationPassive(com.patrick.Formation.SHIELD_WALL);
+                        // hold selection: if a subclass was chosen restrict to it, otherwise apply to all
+                        boolean restrict = (subSel != Subclass.NONE);
+                        battle.holdSelection(tag, includeArchers && restrict);
             }
             if (includeArchers) {
                     battle.setArcherFormationPassive(com.patrick.Formation.LINE);
@@ -209,12 +211,9 @@ public class FormationCommandHandler implements Listener {
                 p.sendMessage("§cSelect Infantry primary before issuing this action.");
                 return;
             }
-            if (subSel == Subclass.NONE) {
-                p.sendMessage("§cSelect a subclass (Axeman/Spearman) first.");
-                return;
-            }
-            // selective follow: apply to chosen subclass
-            battle.followSelection(p, tag, includeArchers && sub != Subclass.NONE);
+            // followSelection accepts a tag==null to mean "all"; if no subclass selected, pass null tag
+            String selectTag = (subSel == Subclass.NONE) ? null : tag;
+            battle.followSelection(p, selectTag, includeArchers && subSel != Subclass.NONE);
             p.sendTitle("§eFollow Order", "Troops will follow you", 5, 40, 5);
             restorePrimaries(p);
             selectedPrimary.remove(id); selectedSubclass.remove(id);
@@ -228,11 +227,8 @@ public class FormationCommandHandler implements Listener {
                 p.sendMessage("§cSelect Infantry primary before issuing this action.");
                 return;
             }
-            if (subSel == Subclass.NONE) {
-                p.sendMessage("§cSelect a subclass (Axeman/Spearman) first.");
-                return;
-            }
-            battle.chargeSelection(tag, includeArchers && sub != Subclass.NONE);
+            String chargeTag = (subSel == Subclass.NONE) ? null : tag;
+            battle.chargeSelection(chargeTag, includeArchers && subSel != Subclass.NONE);
             p.sendTitle("§cCharge Order", "Troops charging!", 5, 40, 5);
             restorePrimaries(p);
             selectedPrimary.remove(id); selectedSubclass.remove(id);
@@ -272,7 +268,7 @@ public class FormationCommandHandler implements Listener {
     public void onInventoryClick(InventoryClickEvent ev) {
         if (!(ev.getWhoClicked() instanceof Player)) return;
         Player p = (Player) ev.getWhoClicked();
-        if (battle.isBattleRunning() && !battle.isCombatRunning()) {
+    if ((battle.isBattleRunning() || battle.getArenaManager().isArenaWorld(p.getWorld())) && !battle.isCombatRunning()) {
             ItemStack cur = ev.getCurrentItem();
             if (cur == null) return;
             ItemMeta cm = cur.getItemMeta();
@@ -289,8 +285,8 @@ public class FormationCommandHandler implements Listener {
 
     @EventHandler
     public void onPlayerDrop(PlayerDropItemEvent ev) {
-        if (!battle.isBattleRunning()) return;
-        if (battle.isCombatRunning()) return;
+    if (!(battle.isBattleRunning() || battle.getArenaManager().isArenaWorld(ev.getPlayer().getWorld()))) return;
+    if (battle.isCombatRunning()) return;
         ItemStack drop = ev.getItemDrop().getItemStack();
         if (drop == null) return;
         ItemMeta dm = drop.getItemMeta();
