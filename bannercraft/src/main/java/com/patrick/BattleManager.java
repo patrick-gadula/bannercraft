@@ -36,7 +36,6 @@ public class BattleManager implements Listener {
     private final List<Zombie> infantry = new ArrayList<>();
     private final List<Skeleton> archers = new ArrayList<>();
 
-    // Enemies
     private final List<Zombie> enemyInfantry = new ArrayList<>();
     private final List<Skeleton> enemyArchers = new ArrayList<>();
 
@@ -44,7 +43,6 @@ public class BattleManager implements Listener {
     private int formationTaskId = -1;
     private int combatTaskId = -1;
 
-    // formation state
     private Formation infFormation = Formation.SHIELD_WALL;
     private Formation archFormation = Formation.LINE;
     private Location infAnchor, archAnchor;
@@ -54,49 +52,42 @@ public class BattleManager implements Listener {
     private Player followTarget = null;
 
     private boolean frozen = false;
-    // admin-created arena setup flag
     private boolean adminSetup = false;
-    // scheduled task for continuous selective follow
     private int selectiveFollowTaskId = -1;
-        // admin simulation task id (runs when admin spawns mobs even if no battleRunning)
-        private int adminSimTaskId = -1;
+    private int adminSimTaskId = -1;
 
-    // per-skeleton shot cooldown (ticks)
     private final Map<UUID, Integer> archerCd = new HashMap<>();
-
-    // per-player troop budget (how many additional troops the player may spawn)
     private final Map<UUID, Integer> playerTroopBudget = new HashMap<>();
-
-    // UI selection state (legacy) was previously here; now managed inline in listeners
-
-    // persistent per-mob formation slot assignment (mob UUID -> slot index)
     private final Map<UUID, Integer> formationAssignments = new HashMap<>();
 
-    // per-group reformation hold (ticks remaining) — during this, combat is paused for that group
     private int infReformTicks = 0;
     private int archReformTicks = 0;
-    // guard to ensure end-of-battle sequence runs only once
     private boolean endScheduled = false;
 
-    public BattleManager(BannerCraft plugin) { 
-        this.plugin = plugin; 
+    /* BattleManager
+    Inputs: BannerCraft plugin
+    Description: Constructor, initializes formation manager and registers handlers
+    Returns: none */
+    public BattleManager(BannerCraft plugin) {
+        this.plugin = plugin;
         this.formationManager = new FormationManager(plugin, arena);
-        // register formation command handler to move hotbar/interaction logic out of this class
         Bukkit.getPluginManager().registerEvents(new FormationCommandHandler(plugin, this, formationManager), plugin);
     }
 
-    // Backwards-compatible overload: spawn on player side by default
+    /* spawnAdminZombie (overload)
+    Inputs: Location loc, InfantryType type
+    Description: Overload that spawns on player side by default
+    Returns: void */
     public void spawnAdminZombie(Location loc, InfantryType type) {
         spawnAdminZombie(loc, type, false);
     }
 
-    // Simple enum to describe admin spawn variants
     public enum InfantryType { AXE, SWORD_SHIELD, SPEAR_SHIELD, MOUNTED_SPEAR }
 
-    /**
-     * Spawn an admin/test zombie variant at the given location. Tags the mob so selection
-     * filters work and attempts to set a default scale via configured command template.
-     */
+    /* spawnAdminZombie
+    Inputs: Location loc, InfantryType type, boolean enemy
+    Description: Spawn an admin/test zombie variant and tag/configure it
+    Returns: void */
     public void spawnAdminZombie(Location loc, InfantryType type, boolean enemy) {
         if (loc == null) return;
         Zombie z = loc.getWorld().spawn(loc, Zombie.class);
@@ -109,14 +100,12 @@ public class BattleManager implements Listener {
                 z.setCustomName("Infantry");
                 try { z.getEquipment().setItemInMainHand(new ItemStack(Material.IRON_AXE)); } catch (Throwable ignore) {}
                 z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "axeman"));
-                    if (enemy) enemyInfantry.add(z); else infantry.add(z);
-                    // AI should follow frozen state (don't enable AI during setup)
-                    try { z.setAI(!frozen); } catch (Throwable ignore) {}
-                    // face the opposing team
-                    try {
-                        Location faceTo = enemy ? arena.getPlayerSideCenter() : arena.getEnemySideCenter();
-                        z.teleport(z.getLocation().setDirection(faceTo.toVector().subtract(z.getLocation().toVector())));
-                    } catch (Throwable ignore) {}
+                if (enemy) enemyInfantry.add(z); else infantry.add(z);
+                try { z.setAI(!frozen); } catch (Throwable ignore) {}
+                try {
+                    Location faceTo = enemy ? arena.getPlayerSideCenter() : arena.getEnemySideCenter();
+                    z.teleport(z.getLocation().setDirection(faceTo.toVector().subtract(z.getLocation().toVector())));
+                } catch (Throwable ignore) {}
             }
             case SWORD_SHIELD -> {
                 z.setCustomName("Infantry");
@@ -124,12 +113,11 @@ public class BattleManager implements Listener {
                 try { z.getEquipment().setItemInOffHand(new ItemStack(Material.SHIELD)); } catch (Throwable ignore) {}
                 z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "swordshield"));
                 if (enemy) enemyInfantry.add(z); else infantry.add(z);
-                    try { z.setAI(!frozen); } catch (Throwable ignore) {}
-                    // face the opposing team
-                    try {
-                        Location faceTo = enemy ? arena.getPlayerSideCenter() : arena.getEnemySideCenter();
-                        z.teleport(z.getLocation().setDirection(faceTo.toVector().subtract(z.getLocation().toVector())));
-                    } catch (Throwable ignore) {}
+                try { z.setAI(!frozen); } catch (Throwable ignore) {}
+                try {
+                    Location faceTo = enemy ? arena.getPlayerSideCenter() : arena.getEnemySideCenter();
+                    z.teleport(z.getLocation().setDirection(faceTo.toVector().subtract(z.getLocation().toVector())));
+                } catch (Throwable ignore) {}
             }
             case SPEAR_SHIELD -> {
                 z.setCustomName("Infantry");
@@ -137,19 +125,17 @@ public class BattleManager implements Listener {
                 try { z.getEquipment().setItemInOffHand(new ItemStack(Material.SHIELD)); } catch (Throwable ignore) {}
                 z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "spearman"));
                 if (enemy) enemyInfantry.add(z); else infantry.add(z);
-                    try { z.setAI(!frozen); } catch (Throwable ignore) {}
-                    // face the opposing team
-                    try {
-                        Location faceTo = enemy ? arena.getPlayerSideCenter() : arena.getEnemySideCenter();
-                        z.teleport(z.getLocation().setDirection(faceTo.toVector().subtract(z.getLocation().toVector())));
-                    } catch (Throwable ignore) {}
+                try { z.setAI(!frozen); } catch (Throwable ignore) {}
+                try {
+                    Location faceTo = enemy ? arena.getPlayerSideCenter() : arena.getEnemySideCenter();
+                    z.teleport(z.getLocation().setDirection(faceTo.toVector().subtract(z.getLocation().toVector())));
+                } catch (Throwable ignore) {}
             }
             case MOUNTED_SPEAR -> {
                 z.setCustomName("Infantry");
                 try { z.getEquipment().setItemInMainHand(new ItemStack(Material.TRIDENT)); } catch (Throwable ignore) {}
                 z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "mounted"));
                 if (enemy) enemyInfantry.add(z); else infantry.add(z);
-                // spawn and mount a horse robustly
                 try {
                     org.bukkit.entity.Horse horse = loc.getWorld().spawn(loc.clone().add(0.5, 0, 0.5), org.bukkit.entity.Horse.class);
                     horse.setAdult();
@@ -157,9 +143,7 @@ public class BattleManager implements Listener {
                     try { horse.getInventory().setSaddle(new ItemStack(Material.SADDLE)); } catch (Throwable ignore) {}
                     try { horse.setAI(!frozen); } catch (Throwable ignore) {}
                     try { horse.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "mounted")); } catch (Throwable ignore) {}
-                    // mount rider onto the horse
                     try { horse.addPassenger(z); } catch (Throwable ignore) {}
-                    // face the opposing team from the mount
                     try {
                         Location faceTo = enemy ? arena.getPlayerSideCenter() : arena.getEnemySideCenter();
                         horse.teleport(horse.getLocation().setDirection(faceTo.toVector().subtract(horse.getLocation().toVector())));
@@ -168,7 +152,6 @@ public class BattleManager implements Listener {
             }
         }
 
-        // Attempt to apply base scale of 0.5 via configured template or Minecraft:scale if available
         try {
             String template = plugin.getConfig().getString("scalingCommand");
             String scale = plugin.getConfig().getString("scalingValue", "0.5");
@@ -176,21 +159,20 @@ public class BattleManager implements Listener {
                 String cmd = template.replace("{target}", z.getUniqueId().toString()).replace("{scale}", scale);
                 Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
             } else {
-                // fallback command for servers supporting Minecraft:scale
                 String cmd = String.format("minecraft:scale base set %s %s", z.getUniqueId().toString(), "0.5");
                 Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
             }
         } catch (Throwable ignore) {}
-
-    // Admin spawn should not auto-start an admin simulation here; admin-created
-    // instances reuse the normal battle setup and the troops respect the
-    // current frozen state until the divider falls.
     }
 
+    /* startBattle
+    Inputs: Player p
+    Description: Prepare and start a normal instanced battle with a 60s setup timer
+    Returns: void */
     public void startBattle(Player p) {
-        if (battleRunning) { 
-            p.sendMessage("§cBattle already running!"); 
-            return; 
+        if (battleRunning) {
+            p.sendMessage("§cBattle already running!");
+            return;
         }
         battleRunning = true;
 
@@ -201,34 +183,29 @@ public class BattleManager implements Listener {
         p.getInventory().remove(Material.STICK);
         giveCommandSticks(p);
 
-        // Setup: keep player in adventure/spectator-like setup with flight allowed so they can arrange
         p.setGameMode(GameMode.ADVENTURE);
         p.setAllowFlight(true);
         p.setFlying(true);
 
-        // spawn + anchors
         Location center = arena.getPlatformCenter();
-        infAnchor  = center.clone().add(0, 0, -5);
+        infAnchor = center.clone().add(0, 0, -5);
         archAnchor = center.clone().add(0, 0, -9);
 
-        // Give player their starting troop: 1 free infantry already present
         UUID pid = p.getUniqueId();
         if (!playerTroopBudget.containsKey(pid)) {
-            // default budget = 0 additional troops; player still gets the free starter
             playerTroopBudget.put(pid, 0);
         }
-    spawnPlayerTroop(infAnchor.clone(), true);
-    formationManager.placeGroup(infantry, infAnchor, infFormation);
+        spawnPlayerTroop(infAnchor.clone(), true);
+        formationManager.placeGroup(infantry, infAnchor, infFormation);
 
-    // Freeze troops during setup so nothing moves across the divider
-    setFrozen(true);
+        setFrozen(true);
 
-        // Provide an early-start item (Redstone) in hotbar slot 4
         ItemStack early = new ItemStack(Material.REDSTONE);
-        ItemMeta earlyMeta = early.getItemMeta(); earlyMeta.setDisplayName("§cStart Battle Early"); early.setItemMeta(earlyMeta);
+        ItemMeta earlyMeta = early.getItemMeta();
+        earlyMeta.setDisplayName("§cStart Battle Early");
+        early.setItemMeta(earlyMeta);
         p.getInventory().setItem(4, early);
 
-        // Automatic 60s setup countdown: show titles at 60,30,10,5..1 and auto-begin
         final int[] secondsLeft = new int[] { 60 };
         final int[] taskHolder = new int[] { -1 };
         taskHolder[0] = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
@@ -244,23 +221,20 @@ public class BattleManager implements Listener {
             secondsLeft[0] = Math.max(0, secondsLeft[0] - 1);
         }, 0L, 20L);
 
-        // Reset any previous command state so a new battle starts in NORMAL mode
         this.commandMode = CommandMode.NORMAL;
         this.followTarget = null;
         this.formationAssignments.clear();
 
-    // spawn enemy troops now but keep them frozen until the barrier drops
-    spawnEnemyTroops();
+        spawnEnemyTroops();
 
-    // just wait for /start to actually drop divider + order combat
-    p.sendMessage("§eTroops are ready. Use /start when ready to begin!");
+        p.sendMessage("§eTroops are ready. Use /start when ready to begin!");
     }
 
-    /**
-     * Prepare an admin-created arena like startBattle but without spawning enemy troops
-     * or setting battleRunning to true. This lets admins use the same setup tools
-     * and formation commands while having full control over spawning.
-     */
+    /* enterAdminSetup
+    Inputs: Player p
+    Description: Prepare an admin-created arena like startBattle but without spawning enemy troops
+    or setting battleRunning to true. Allows admins to use setup tools and control spawning.
+    Returns: void */
     public void enterAdminSetup(Player p) {
         arena.createArena();
         arena.buildDivider();
@@ -277,90 +251,87 @@ public class BattleManager implements Listener {
         infAnchor  = center.clone().add(0, 0, -5);
         archAnchor = center.clone().add(0, 0, -9);
 
-        // freeze troops during admin setup so they don't wander across divider
-    setFrozen(true);
-    // mark admin setup active so /start can begin combat manually
-    this.adminSetup = true;
-    // reset selection/command state similar to startBattle
-    this.commandMode = CommandMode.NORMAL;
-    this.followTarget = null;
-    this.formationAssignments.clear();
+        setFrozen(true);
+        this.adminSetup = true;
+        this.commandMode = CommandMode.NORMAL;
+        this.followTarget = null;
+        this.formationAssignments.clear();
     }
 
-    /** Put the given player into setup mode (arena created already). Keeps troops frozen and gives command sticks. */
+    /* enterSetupMode
+    Inputs: Player p
+    Description: Put the given player into setup mode (arena created already). Keeps troops frozen and gives command sticks.
+    Returns: void */
     public void enterSetupMode(Player p) {
-        // ensure troops won't act until the wall falls
         setFrozen(true);
-        // give normal tools so admin/player can arrange
         giveCommandSticks(p);
     }
 
+    /* beginCombat
+    Inputs: none
+    Description: Transition an arena from setup/admin state into active combat. Removes divider, unfreezes troops,
+    enables AI, initializes formation bursts, starts combat ticker, and applies scaling.
+    Returns: void */
     public void beginCombat() {
-        // allow beginCombat when a normal battle is running or when an admin-created
-        // instance has been prepared (adminSetup = true) and is manually started.
         if (!battleRunning && !adminSetup) return;
         if (!battleRunning && adminSetup) {
-            // transition admin setup into a running battle
             battleRunning = true;
             adminSetup = false;
         }
         arena.removeDivider();
-    // Unfreeze troops now that the barrier is down and start combat behavior
-    setFrozen(false);
+        setFrozen(false);
 
-    // Ensure all allied mobs have AI enabled and issue an immediate move command
-    infantry.forEach(m -> { if (!m.isDead()) { m.setAI(true); } });
-    archers.forEach(m -> { if (!m.isDead()) { m.setAI(true); } });
+        infantry.forEach(m -> { if (!m.isDead()) { m.setAI(true); } });
+        archers.forEach(m -> { if (!m.isDead()) { m.setAI(true); } });
 
-    // Trigger a short reformation burst so troops walk into their combat slots
-    infReformTicks = archReformTicks = 80; // ~4s of reforming
-    formationManager.initializeFormationAssignments(infantry, infAnchor, infFormation);
-    formationManager.moveGroupInFormation(infantry, infAnchor, infFormation);
-    formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
-    formationManager.initializeFormationAssignments(archers, archAnchor, archFormation);
-    formationManager.moveGroupInFormation(archers, archAnchor, archFormation);
-    formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
+        infReformTicks = archReformTicks = 80;
+        formationManager.initializeFormationAssignments(infantry, infAnchor, infFormation);
+        formationManager.moveGroupInFormation(infantry, infAnchor, infFormation);
+        formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
+        formationManager.initializeFormationAssignments(archers, archAnchor, archFormation);
+        formationManager.moveGroupInFormation(archers, archAnchor, archFormation);
+        formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
 
-    // Ensure enemy mobs have AI enabled so they can act when combat starts
-    enemyInfantry.forEach(m -> { if (!m.isDead()) m.setAI(true); });
-    enemyArchers.forEach(m -> { if (!m.isDead()) m.setAI(true); });
+        enemyInfantry.forEach(m -> { if (!m.isDead()) m.setAI(true); });
+        enemyArchers.forEach(m -> { if (!m.isDead()) m.setAI(true); });
 
-    // Clear players' inventories for combat and give a single redstone torch (charge command)
-    for (Player pl : Bukkit.getOnlinePlayers()) {
-        pl.getInventory().clear();
-        try { pl.getInventory().setArmorContents(new ItemStack[0]); } catch (Throwable ignore) {}
-        ItemStack charge = new ItemStack(Material.REDSTONE_TORCH);
-        ItemMeta cm = charge.getItemMeta(); cm.setDisplayName("§cCharge"); charge.setItemMeta(cm);
-        pl.getInventory().setItem(4, charge);
-    }
+        for (Player pl : Bukkit.getOnlinePlayers()) {
+            pl.getInventory().clear();
+            try { pl.getInventory().setArmorContents(new ItemStack[0]); } catch (Throwable ignore) {}
+            ItemStack charge = new ItemStack(Material.REDSTONE_TORCH);
+            ItemMeta cm = charge.getItemMeta(); cm.setDisplayName("§cCharge"); charge.setItemMeta(cm);
+            pl.getInventory().setItem(4, charge);
+        }
 
         startCombatTicker();
-        // Preserve follow state if a selective follow task is active; otherwise reset
         if (selectiveFollowTaskId != -1 && this.followTarget != null) {
             this.commandMode = CommandMode.FOLLOW;
         } else {
             this.commandMode = CommandMode.NORMAL;
             this.followTarget = null;
         }
-        // Disable flight and ensure players are in SURVIVAL when combat actually begins
         for (Player pl : Bukkit.getOnlinePlayers()) {
             pl.setGameMode(GameMode.SURVIVAL);
             pl.setAllowFlight(false);
             pl.setFlying(false);
         }
-    String msg = "§cThe battle has begun!";
-    Bukkit.getOnlinePlayers().forEach(pl -> pl.sendMessage(msg));
+        String msg = "§cThe battle has begun!";
+        Bukkit.getOnlinePlayers().forEach(pl -> pl.sendMessage(msg));
 
-        // Attempt to scale players and mobs via configured attribute command if present
         tryApplyScaling();
     }
 
+    /* stopBattle
+    Inputs: none
+    Description: Stop the current battle, cancel tickers and tasks, remove and clear all troops,
+    clear inventories for players and teleport them back, and sweep named battle mobs across worlds.
+    Returns: void */
     public void stopBattle() {
         battleRunning = false;
-    adminSetup = false;
+        adminSetup = false;
         stopFormationTicker();
         stopCombatTicker();
-    stopAdminSimulation();
+        stopAdminSimulation();
 
         infantry.forEach(e -> { if (!e.isDead()) e.remove(); });
         archers.forEach(e -> { if (!e.isDead()) e.remove(); });
@@ -372,7 +343,6 @@ public class BattleManager implements Listener {
         archerCd.clear();
         infReformTicks = archReformTicks = 0;
 
-        // remove command tools and sweep only our named battle mobs across all worlds
         for (Player pl : Bukkit.getOnlinePlayers()) {
             pl.getInventory().remove(Material.LIME_DYE);
             pl.getInventory().remove(Material.IRON_SWORD);
@@ -397,11 +367,13 @@ public class BattleManager implements Listener {
         }
     }
 
-    // Admin simulation: run a light combat loop even when battleRunning is false so admin can test.
+    /* startAdminSimulation
+    Inputs: none
+    Description: Start a lightweight admin simulation task that runs auto combat loops while not in a battle.
+    Returns: void */
     private void startAdminSimulation() {
         if (adminSimTaskId != -1) return;
         adminSimTaskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
-            // simple auto combat loop between any alive allies and enemies
             List<LivingEntity> enemyTargets = new ArrayList<>();
             enemyInfantry.stream().filter(e -> !e.isDead()).forEach(enemyTargets::add);
             List<LivingEntity> allyTargets = new ArrayList<>();
@@ -412,6 +384,10 @@ public class BattleManager implements Listener {
         }, 10L, 10L);
     }
 
+    /* stopAdminSimulation
+    Inputs: none
+    Description: Stop the admin simulation task if running.
+    Returns: void */
     private void stopAdminSimulation() {
         if (adminSimTaskId != -1) {
             try { Bukkit.getScheduler().cancelTask(adminSimTaskId); } catch (Throwable ignore) {}
@@ -419,8 +395,11 @@ public class BattleManager implements Listener {
         }
     }
 
+    /* giveCommandSticks
+    Inputs: Player p
+    Description: Populate the player's hotbar with primary formation selector items.
+    Returns: void */
     public void giveCommandSticks(Player p) {
-        // Primary formation selectors placed in hotbar slots 0..3
         p.getInventory().clear();
 
         ItemStack everyone = new ItemStack(Material.LIME_DYE);
@@ -435,16 +414,17 @@ public class BattleManager implements Listener {
         ItemStack calv = new ItemStack(Material.SADDLE);
         ItemMeta cm = calv.getItemMeta(); cm.setDisplayName("§6Calvary"); calv.setItemMeta(cm);
 
-    p.getInventory().setItem(0, everyone);
-    p.getInventory().setItem(1, vanguard);
-    p.getInventory().setItem(2, arch);
-    p.getInventory().setItem(3, calv);
+        p.getInventory().setItem(0, everyone);
+        p.getInventory().setItem(1, vanguard);
+        p.getInventory().setItem(2, arch);
+        p.getInventory().setItem(3, calv);
     }
 
-    /**
-     * Attempt to spawn a troop for the player; respects per-player budget.
-     * If budget is zero, only allow the free starter that was already given in startBattle.
-     */
+    /* spawnPlayerTroopFor
+    Inputs: Player p, Location loc, boolean infantryType
+    Description: Attempt to spawn a troop for the player; respects per-player budget. If budget is zero,
+    disallow additional spawns and inform the player.
+    Returns: boolean indicating success */
     public boolean spawnPlayerTroopFor(Player p, Location loc, boolean infantryType) {
         UUID pid = p.getUniqueId();
         int budget = playerTroopBudget.getOrDefault(pid, 0);
@@ -452,13 +432,15 @@ public class BattleManager implements Listener {
             p.sendMessage("§cNo troop budget remaining. Buy troops to spawn more.");
             return false;
         }
-        // decrement budget and spawn
         playerTroopBudget.put(pid, budget - 1);
         spawnPlayerTroop(loc, infantryType);
         return true;
     }
 
-    // Only open secondary hotbar when player actually interacts (right-click) with a primary item.
+    /* onPlayerInteract
+    Inputs: PlayerInteractEvent ev
+    Description: Handle right-click interactions for setup (early start) and combat (charge torch); primary selectors are handled elsewhere.
+    Returns: void */
     @EventHandler
     public void onPlayerInteract(PlayerInteractEvent ev) {
         if (!battleRunning) return;
@@ -468,54 +450,40 @@ public class BattleManager implements Listener {
         if (inHand == null) return;
         Material m = inHand.getType();
 
-        // Early-start hotbar item (redstone) during setup
         if (m == Material.REDSTONE) {
             ev.setCancelled(true);
             if (combatTaskId == -1) beginCombat();
             return;
         }
 
-        // Charge torch during combat: right-click to order charge
         if (m == Material.REDSTONE_TORCH) {
             ev.setCancelled(true);
-            // only meaningful during combat
             if (combatTaskId != -1 && battleRunning) {
                 orderCharge();
                 p.sendMessage("§cCharge order given!");
-                // remove torch from slot 4 to avoid repeated use
                 p.getInventory().setItem(4, null);
             }
             return;
         }
 
-        // Primaries are handled by FormationCommandHandler; ignore here to avoid double-handling.
         if (m == Material.LIME_DYE || m == Material.IRON_SWORD || m == Material.BOW || m == Material.SADDLE) {
             ev.setCancelled(true);
             return;
         }
 
-        // If player clicks Back, restore primaries
         if (m == Material.GRAY_DYE) {
             ev.setCancelled(true);
             giveCommandSticks(p);
         }
     }
 
-    // Inventory and drop handling moved to FormationCommandHandler to centralize UI logic.
-
-    // NOTE: scaling players and mobs to 0.5 is not supported directly via the Bukkit API.
-    // Native entity/player scaling requires server-specific features or client-side resource packs.
-    // Alternatives:
-    //  - Spawn 'baby' variants where available (Zombie#setBaby(true)) to approximate smaller mobs.
-    //  - Use a third-party plugin (e.g. LibsDisguises or an entity-scaling plugin) or Paper API if available.
-    // If you want, I can implement baby-zombies for infantry and keep archers as standard, or add hooks
-    // for an external scaling plugin.
-
+    /* onPlayerQuit
+    Inputs: PlayerQuitEvent ev
+    Description: Cleanup budget state, cancel selective follow when the follow target disconnects, and send player back to saved overworld location if they disconnected from the arena.
+    Returns: void */
     @EventHandler
     public void onPlayerQuit(PlayerQuitEvent ev) {
-        // cleanup budget state
         playerTroopBudget.remove(ev.getPlayer().getUniqueId());
-        // if the quitting player was the follow target, cancel selective follow
         try {
             if (followTarget != null && ev.getPlayer().getUniqueId().equals(followTarget.getUniqueId())) {
                 followTarget = null;
@@ -525,21 +493,22 @@ public class BattleManager implements Listener {
                 }
                 this.commandMode = CommandMode.NORMAL;
             }
-            // If the player disconnected while in the arena, send them back to their saved overworld
             try { if (arena.isArenaWorld(ev.getPlayer().getWorld())) arena.sendBack(ev.getPlayer()); } catch (Throwable ignore) {}
         } catch (Throwable ignore) {}
     }
 
+    /* spawnPlayerTroop
+    Inputs: Location loc, boolean infantryType
+    Description: Spawn either an infantry or archer troop at the given location and prepare the mob.
+    Returns: void */
     public void spawnPlayerTroop(Location loc, boolean infantryType) {
         if (infantryType) {
             Zombie z = loc.getWorld().spawn(loc, Zombie.class);
             z.setCustomName("Axeman");
             try { z.setCustomNameVisible(true); } catch (Throwable ignore) {}
             try { z.getEquipment().setItemInMainHand(new ItemStack(Material.IRON_AXE)); } catch (Throwable ignore) {}
-            // tag entity with subclass metadata for robust selection
             try { z.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "axeman")); } catch (Throwable ignore) {}
             z.setShouldBurnInDay(false);
-            // prepare mob (scaling attempted in prepareMob via Attribute.SCALE when available)
             prepareMob(z);
             infantry.add(z);
         } else {
@@ -552,7 +521,10 @@ public class BattleManager implements Listener {
         }
     }
 
-
+    /* spawnEnemyTroops
+    Inputs: none
+    Description: Spawn a preset group of enemy infantry and configure their equipment and health.
+    Returns: void */
     private void spawnEnemyTroops() {
         Location center = arena.getEnemySideCenter();
         for (int i = 0; i < 5; i++) {
@@ -562,40 +534,38 @@ public class BattleManager implements Listener {
             try { bandit.setMetadata("troop_subclass", new FixedMetadataValue(plugin, "bandit")); } catch (Throwable ignore) {}
             prepareMob(bandit);
 
-            // Equip sword
             bandit.getEquipment().setItemInMainHand(new ItemStack(Material.IRON_SWORD));
 
-            // Buff health
             try { if (bandit.getAttribute(Attribute.MAX_HEALTH) != null) bandit.getAttribute(Attribute.MAX_HEALTH).setBaseValue(30.0); } catch (Exception ignore) {}
             try { bandit.setHealth(30.0); } catch (Exception ignore) {}
-
-            // scaling is handled via Attribute.SCALE where available
 
             enemyInfantry.add(bandit);
         }
     }
 
-
+    /* prepareMob
+    Inputs: Mob mob
+    Description: Remove default goals, lock pickup/targeting settings, and attempt to set SCALE attribute when present.
+    Returns: void */
     private void prepareMob(Mob mob) {
         Bukkit.getMobGoals().removeAllGoals(mob);
         mob.setCollidable(true);
         mob.setCanPickupItems(false);
         mob.setTarget(null);
         mob.setInvulnerable(false);
-        mob.setRemoveWhenFarAway(false); 
+        mob.setRemoveWhenFarAway(false);
         try {
-            // Try to set a SCALE attribute when available (Paper/modern servers)
             try {
-                Attribute a = Attribute.valueOf("SCALE");
-                if (a != null && mob.getAttribute(a) != null) {
-                    mob.getAttribute(a).setBaseValue(0.5);
-                }
-            } catch (IllegalArgumentException ignore) {
-                // SCALE not present; ignore
-            }
+                var attr = mob.getAttribute(Attribute.SCALE);
+                if (attr != null) attr.setBaseValue(0.5);
+            } catch (Throwable ignore) {}
         } catch (Throwable ignore) {}
     }
 
+    /* setFrozen
+    Inputs: boolean frozen
+    Description: Toggle frozen state and enable/disable AI for all troop groups.
+    Returns: void */
     private void setFrozen(boolean frozen) {
         this.frozen = frozen;
         infantry.forEach(m -> m.setAI(!frozen));
@@ -604,7 +574,10 @@ public class BattleManager implements Listener {
         enemyArchers.forEach(m -> m.setAI(!frozen));
     }
 
-
+    /* stopFormationTicker
+    Inputs: none
+    Description: Cancel the scheduled formation task if present.
+    Returns: void */
     private void stopFormationTicker() {
         if (formationTaskId != -1) {
             Bukkit.getScheduler().cancelTask(formationTaskId);
@@ -612,12 +585,15 @@ public class BattleManager implements Listener {
         }
     }
 
+    /* startCombatTicker
+    Inputs: none
+    Description: Start the repeating combat ticker which handles reforming, AI actions, enemy actions, and cooldowns.
+    Returns: void */
     private void startCombatTicker() {
         stopCombatTicker();
         combatTaskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
             if (!battleRunning) return;
 
-            // If a group is reforming, drive them to new slots and skip their combat this tick
             boolean infReforming  = infReformTicks  > 0;
             boolean archReforming = archReformTicks > 0;
 
@@ -630,22 +606,18 @@ public class BattleManager implements Listener {
                 archReformTicks = Math.max(0, archReformTicks - 10);
             }
 
-            // Allies act (skip groups that are reforming)
             if (!(infReforming || archReforming)) {
                 if (commandMode == CommandMode.HOLD) {
-                    // do nothing – troops stay in place
                 } else if (commandMode == CommandMode.FOLLOW && followTarget != null) {
                     formationManager.moveGroupInFormation(infantry, followTarget.getLocation().add(0, 0, 2), infFormation);
                     formationManager.moveGroupInFormation(archers,  followTarget.getLocation().add(0, 0, -2), archFormation);
                 } else if (commandMode == CommandMode.CHARGE) {
-                    // charge = actively target enemies
                     List<LivingEntity> enemyTargets = new ArrayList<>();
                     enemyInfantry.stream().filter(e -> !e.isDead()).forEach(enemyTargets::add);
                     autoCombat(infantry, archers, enemyTargets);
                 }
             }
 
-            // Enemies act (bandits only)
             List<LivingEntity> allyTargets = new ArrayList<>();
             infantry.stream().filter(e -> !e.isDead()).forEach(allyTargets::add);
             archers.stream().filter(e -> !e.isDead()).forEach(allyTargets::add);
@@ -653,12 +625,14 @@ public class BattleManager implements Listener {
 
             checkWinLose();
 
-            // tick down archer cooldowns (loop runs every 10 ticks)
             archerCd.replaceAll((id, cd) -> Math.max(0, cd - 10));
         }, 10L, 10L);
     }
 
-
+    /* stopCombatTicker
+    Inputs: none
+    Description: Cancel the combat ticker if running.
+    Returns: void */
     private void stopCombatTicker() {
         if (combatTaskId != -1) {
             Bukkit.getScheduler().cancelTask(combatTaskId);
@@ -666,68 +640,62 @@ public class BattleManager implements Listener {
         }
     }
 
-    // Formation logic moved into FormationManager to keep this class focused.
+    /* setInfantryFormation
+    Inputs: Formation f, Location ignored
+    Description: Set infantry formation and anchor; snap instantly during setup or schedule reforming during combat.
+    Returns: void */
     public void setInfantryFormation(Formation f, Location ignored) {
         this.infFormation = f;
-    // if caller provided a specific anchor location, use it; otherwise compute centroid
-    if (ignored != null) this.infAnchor = ignored;
-    else this.infAnchor = formationManager.centroid(infantry);
-    if (frozen) {
-            // during setup: snap instantly so the player sees the change
+        if (ignored != null) this.infAnchor = ignored;
+        else this.infAnchor = formationManager.centroid(infantry);
+        if (frozen) {
             formationManager.placeGroup(infantry, infAnchor, infFormation);
             infReformTicks = 0;
         } else {
-            // mid-battle: walk into the new shape and pause their combat briefly
-            infReformTicks = 80; // ~4s
-            // preassign slots deterministically so the first move call is stable
+            infReformTicks = 80;
             formationManager.initializeFormationAssignments(infantry, infAnchor, infFormation);
-            // run a short burst of movement+snap checks so they settle on first command
             formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
         }
     }
 
-    /**
-     * Set the infantry formation state without issuing movement commands.
-     * Useful for Hold commands where troops should keep their current positions.
-     */
+    /* setInfantryFormationPassive
+    Inputs: Formation f
+    Description: Set the infantry formation state without issuing movement commands.
+    Returns: void */
     public void setInfantryFormationPassive(Formation f) {
         this.infFormation = f;
     }
 
+    /* setArcherFormation
+    Inputs: Formation f, Location ignored
+    Description: Set archer formation and anchor; snap during setup or schedule reforming during combat.
+    Returns: void */
     public void setArcherFormation(Formation f, Location ignored) {
         this.archFormation = f;
-    if (ignored != null) this.archAnchor = ignored;
-    else this.archAnchor = formationManager.centroid(archers);
+        if (ignored != null) this.archAnchor = ignored;
+        else this.archAnchor = formationManager.centroid(archers);
         if (frozen) {
             formationManager.placeGroup(archers, archAnchor, archFormation);
             archReformTicks = 0;
         } else {
             archReformTicks = 80;
-            // preassign slots deterministically so the first move call is stable
             formationManager.initializeFormationAssignments(archers, archAnchor, archFormation);
             formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
         }
     }
 
-    /**
-     * Set the archer formation state without issuing movement commands.
-     */
+    /* setArcherFormationPassive
+    Inputs: Formation f
+    Description: Set the archer formation state without issuing movement commands.
+    Returns: void */
     public void setArcherFormationPassive(Formation f) {
         this.archFormation = f;
     }
 
-    /**
-     * Apply a formation to a selected subset of troops. If the battle is in setup
-     * (frozen) the formation will snap into place; otherwise troops will be
-     * asked to walk into formation and a short movement burst will be scheduled.
-     *
-     * @param playerId player who issued the command (currently unused but kept for future)
-     * @param subclassTag "axeman", "spearman" or null to select all
-     * @param includeInfantry whether infantry should be targeted
-     * @param includeArchers whether archers should be targeted
-     * @param formation desired formation
-     * @param anchor formation anchor location (if null, arena center is used)
-     */
+    /* applyFormationToSelection
+    Inputs: UUID playerId, String subclassTag, boolean includeInfantry, boolean includeArchers, Formation formation, Location anchor
+    Description: Apply a formation to a selected subset of troops. Snap into place during setup; otherwise schedule movement.
+    Returns: void */
     public void applyFormationToSelection(java.util.UUID playerId, String subclassTag, boolean includeInfantry, boolean includeArchers, Formation formation, Location anchor) {
         if (anchor == null) anchor = arena.getPlatformCenter();
 
@@ -739,7 +707,6 @@ public class BattleManager implements Listener {
             }
             if (!targets.isEmpty()) {
                 if (frozen) {
-                    // snap into place during setup
                     formationManager.placeGroup(targets, anchor, formation);
                 } else {
                     formationManager.initializeFormationAssignments(targets, anchor, formation);
@@ -767,19 +734,19 @@ public class BattleManager implements Listener {
         }
     }
 
-    // Side-aware APIs for admin mode: apply formation to either player or enemy side depending on `onEnemy`.
+    /* applyFormationToSide
+    Inputs: boolean onEnemy, String subclassTag, boolean includeInfantry, boolean includeArchers, Formation formation, Location anchor
+    Description: Side-aware API to apply formation to the player or enemy side depending on onEnemy.
+    Returns: void */
     public void applyFormationToSide(boolean onEnemy, String subclassTag, boolean includeInfantry, boolean includeArchers, Formation formation, Location anchor) {
         if (onEnemy) {
-            // operate only on enemy lists
             List<Zombie> targets = new ArrayList<>();
             for (Zombie z : enemyInfantry) if (!z.isDead() && (subclassTag == null || subclassTag.isEmpty() || hasTag(z, subclassTag))) targets.add(z);
             if (!targets.isEmpty()) {
                 if (frozen) formationManager.placeGroup(targets, anchor, formation);
                 else { formationManager.initializeFormationAssignments(targets, anchor, formation); formationManager.moveGroupInFormation(targets, anchor, formation); formationManager.scheduleFormationBurst(targets, anchor, formation); }
             }
-            // archers not supported for enemy in this admin flow for now
         } else {
-            // operate on player-side lists
             if (includeInfantry) {
                 List<Zombie> targets = new ArrayList<>();
                 for (Zombie z : infantry) if (!z.isDead() && (subclassTag == null || subclassTag.isEmpty() || hasTag(z, subclassTag))) targets.add(z);
@@ -799,33 +766,21 @@ public class BattleManager implements Listener {
         }
     }
 
-    // formation bursts delegated to FormationManager
-
-    // Deterministically assign each alive troop to a centered slot so the first reform
-    // tick will already have stable assignments and snap behavior.
-    // initialization delegated to FormationManager
-
-    // centroid delegated to FormationManager
-
-    // Attempt to scale players and mobs using a configurable server command template
-    // The plugin config may provide a `scalingCommand` such as:
-    //   attribute scale set {target} {scale}
-    // where {target} and {scale} are placeholders. This method dispatches that
-    // command for each online player and for any named battle mobs (UUID is used
-    // as the default mob placeholder). If no template is configured, this is a no-op.
+    /* tryApplyScaling
+    Inputs: none
+    Description: Dispatch configured scaling command template for online players and named battle mobs; no-op if no template configured.
+    Returns: void */
     private void tryApplyScaling() {
         String template = plugin.getConfig().getString("scalingCommand");
         if (template == null || template.isBlank()) return;
         String scale = plugin.getConfig().getString("scalingValue", "0.5");
 
-        // Scale players
         for (Player pl : Bukkit.getOnlinePlayers()) {
             String cmd = template.replace("{target}", pl.getName()).replace("{scale}", scale);
             Bukkit.getLogger().info(String.format("Dispatching scaling command: %s", cmd));
             Bukkit.dispatchCommand(Bukkit.getConsoleSender(), cmd);
         }
 
-        // Scale named battle mobs (replace {target} with the entity UUID)
         for (World w : Bukkit.getWorlds()) {
             for (org.bukkit.entity.Entity ent : w.getEntities()) {
                 if (ent instanceof LivingEntity) {
@@ -842,7 +797,10 @@ public class BattleManager implements Listener {
         }
     }
 
-    // ===== Simple auto-combat (melee hits + archer kiting & shots) =====
+    /* autoCombat
+    Inputs: List<Zombie> meleeAllies, List<Skeleton> rangedAllies, List<LivingEntity> enemies
+    Description: Simple auto-combat loop that handles melee movement/attacks and archer behavior.
+    Returns: void */
     private void autoCombat(List<Zombie> meleeAllies, List<Skeleton> rangedAllies,
                         List<LivingEntity> enemies) {
 
@@ -896,18 +854,18 @@ public class BattleManager implements Listener {
         }
     }
 
-
-    // ===== Player-issued orders =====
+    /* orderCharge
+    Inputs: none
+    Description: Switch troops to CHARGE mode and assign targets accordingly.
+    Returns: void */
     public void orderCharge() {
         this.commandMode = CommandMode.CHARGE;
-        // If a selective follow is active, cancel it so troops stop following the player
         if (selectiveFollowTaskId != -1) {
             try { Bukkit.getScheduler().cancelTask(selectiveFollowTaskId); } catch (Throwable ignore) {}
             selectiveFollowTaskId = -1;
         }
         this.followTarget = null;
 
-        // Player infantry charge nearest bandit
         for (Zombie z : infantry) {
             z.setAI(true);
             LivingEntity target = nearest(z.getLocation(), new ArrayList<>(enemyInfantry));
@@ -916,7 +874,6 @@ public class BattleManager implements Listener {
             }
         }
 
-        // Player archers charge nearest bandit
         for (Skeleton s : archers) {
             s.setAI(true);
             LivingEntity target = nearest(s.getLocation(), new ArrayList<>(enemyInfantry));
@@ -924,46 +881,51 @@ public class BattleManager implements Listener {
                 s.setTarget(target);
             }
         }
-    // quick formation movement so troops visibly surge forward when charged
-    formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
-    formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
+        formationManager.scheduleFormationBurst(infantry, infAnchor, infFormation);
+        formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
     }
 
-
+    /* orderFollow
+    Inputs: Player p
+    Description: Set FOLLOW mode and move troops to positions around the player.
+    Returns: void */
     public void orderFollow(Player p) {
         this.commandMode = CommandMode.FOLLOW;
         this.followTarget = p;
 
-        // Unfreeze troops so they can move again
         infantry.forEach(m -> m.setAI(true));
         archers.forEach(m -> m.setAI(true));
-        // immediately move groups to positions around the player so the reaction is visible
         formationManager.initializeFormationAssignments(infantry, p.getLocation().add(0, 0, 2), infFormation);
         formationManager.moveGroupInFormation(infantry, p.getLocation().add(0, 0, 2), infFormation);
         formationManager.scheduleFormationBurst(infantry, p.getLocation().add(0, 0, 2), infFormation);
         formationManager.initializeFormationAssignments(archers, p.getLocation().add(0, 0, -2), archFormation);
         formationManager.moveGroupInFormation(archers, p.getLocation().add(0, 0, -2), archFormation);
         formationManager.scheduleFormationBurst(archers, p.getLocation().add(0, 0, -2), archFormation);
-        }
+    }
 
+    /* orderHold
+    Inputs: none
+    Description: Set HOLD mode and disable AI for all troops.
+    Returns: void */
     public void orderHold() {
         this.commandMode = CommandMode.HOLD;
         infantry.forEach(m -> m.setAI(false));
         archers.forEach(m -> m.setAI(false));
     }
 
-    // Selective orders that apply only to troops with matching metadata tag.
+    /* followSelection
+    Inputs: Player p, String subclassTag, boolean includeArchers
+    Description: Begin a selective follow task for troops matching subclassTag that follows the player.
+    Returns: void */
     public void followSelection(Player p, String subclassTag, boolean includeArchers) {
         this.commandMode = CommandMode.FOLLOW;
         this.followTarget = p;
 
-        // cancel any previous selective follow task
         if (selectiveFollowTaskId != -1) {
             Bukkit.getScheduler().cancelTask(selectiveFollowTaskId);
             selectiveFollowTaskId = -1;
         }
 
-        // unfreeze targeted mobs so they can move
         infantry.forEach(m -> {
             try { if (hasTag(m, subclassTag)) m.setAI(true); } catch (Throwable ignore) {}
         });
@@ -973,10 +935,7 @@ public class BattleManager implements Listener {
             });
         }
 
-        // schedule a repeating follow task that updates selective groups frequently
         selectiveFollowTaskId = Bukkit.getScheduler().scheduleSyncRepeatingTask(plugin, () -> {
-            // keep the task running during admin-created setup (arena world) even when
-            // battleRunning is false so admins can use selective follow while arranging.
             if (followTarget == null) {
                 if (selectiveFollowTaskId != -1) {
                     Bukkit.getScheduler().cancelTask(selectiveFollowTaskId);
@@ -985,7 +944,6 @@ public class BattleManager implements Listener {
                 return;
             }
             if (!battleRunning) {
-                // if not in a running battle, only allow when the target player is inside the arena
                 try {
                     if (!arena.isArenaWorld(followTarget.getWorld())) {
                         if (selectiveFollowTaskId != -1) {
@@ -1009,9 +967,12 @@ public class BattleManager implements Listener {
         }, 0L, 10L);
     }
 
+    /* holdSelection
+    Inputs: String subclassTag, boolean includeArchers
+    Description: Hold mode applied only to troops matching subclassTag.
+    Returns: void */
     public void holdSelection(String subclassTag, boolean includeArchers) {
         this.commandMode = CommandMode.HOLD;
-        // disable AI only for matching troops
         infantry.forEach(m -> {
             try { if (hasTag(m, subclassTag)) m.setAI(false); } catch (Throwable ignore) {}
         });
@@ -1020,6 +981,10 @@ public class BattleManager implements Listener {
         });
     }
 
+    /* chargeSelection
+    Inputs: String subclassTag, boolean includeArchers
+    Description: Charge mode applied only to troops matching subclassTag and schedules a formation burst.
+    Returns: void */
     public void chargeSelection(String subclassTag, boolean includeArchers) {
         this.commandMode = CommandMode.CHARGE;
         if (selectiveFollowTaskId != -1) {
@@ -1027,7 +992,7 @@ public class BattleManager implements Listener {
             selectiveFollowTaskId = -1;
         }
         this.followTarget = null;
-        // targeted charge: set targets only for matching troops
+
         for (Zombie z : infantry) {
             try {
                 if (!hasTag(z, subclassTag)) continue;
@@ -1048,10 +1013,13 @@ public class BattleManager implements Listener {
         formationManager.scheduleFormationBurst(archers, archAnchor, archFormation);
     }
 
+    /* hasTag
+    Inputs: Entity e, String tag
+    Description: Return true when the entity has a troop_subclass metadata matching tag; null/empty tag matches all.
+    Returns: boolean */
     private boolean hasTag(org.bukkit.entity.Entity e, String tag) {
-    if (e == null) return false;
-    // empty or null tag means match all
-    if (tag == null || tag.isEmpty()) return true;
+        if (e == null) return false;
+        if (tag == null || tag.isEmpty()) return true;
         try {
             if (e.hasMetadata("troop_subclass")) {
                 return e.getMetadata("troop_subclass").stream().anyMatch(md -> tag.equalsIgnoreCase(md.asString()));
@@ -1060,7 +1028,10 @@ public class BattleManager implements Listener {
         return false;
     }
 
-
+    /* nearest
+    Inputs: Location from, List<LivingEntity> list
+    Description: Find the closest living entity to the provided location from the list.
+    Returns: LivingEntity or null */
     private LivingEntity nearest(Location from, List<LivingEntity> list) {
         double best = Double.MAX_VALUE;
         LivingEntity pick = null;
@@ -1071,17 +1042,17 @@ public class BattleManager implements Listener {
         return pick;
     }
 
-    // Builds a velocity that compensates mildly for gravity and scales speed by distance
+    /* aimArrow
+    Inputs: Location fromEye, Location toEye
+    Description: Build a projectile velocity vector that compensates for gravity and scales with distance.
+    Returns: Vector */
     private org.bukkit.util.Vector aimArrow(Location fromEye, Location toEye) {
         org.bukkit.util.Vector diff = toEye.toVector().subtract(fromEye.toVector());
         double dist = fromEye.distance(toEye);
         double horiz = Math.hypot(diff.getX(), diff.getZ());
 
-        // speed scales gently with distance (clamped)
         double speed = Math.max(1.4, Math.min(1.9, 1.15 + 0.04 * dist));
-
-        // mild gravity compensation — proportional to horizontal distance
-        double lift = 0.010 * horiz; // was 0.008; a touch more keeps shots from falling short
+        double lift = 0.010 * horiz;
 
         org.bukkit.util.Vector dir = diff.normalize();
         dir.setY(dir.getY() + lift);
@@ -1089,6 +1060,10 @@ public class BattleManager implements Listener {
         return dir.normalize().multiply(speed);
     }
 
+    /* checkWinLose
+    Inputs: none
+    Description: Check for win/lose conditions and schedule stopBattle with a delay when the battle ends.
+    Returns: void */
     private void checkWinLose() {
         boolean enemiesAlive = enemyInfantry.stream().anyMatch(e -> !e.isDead())
                 || enemyArchers.stream().anyMatch(e -> !e.isDead());
@@ -1100,12 +1075,15 @@ public class BattleManager implements Listener {
                 endScheduled = true;
                 String winnerMsg = !enemiesAlive ? "§aYou won!" : "§cYou lost!";
                 Bukkit.getOnlinePlayers().forEach(pl -> pl.sendTitle(winnerMsg, "Returning in 10s...", 5, 40, 5));
-                // delay actual stop to allow celebration / rewards
                 Bukkit.getScheduler().scheduleSyncDelayedTask(plugin, () -> stopBattle(), 20L * 10);
             }
         }
     }
 
+    /* onArenaMobDeath
+    Inputs: EntityDeathEvent ev
+    Description: Handle troop death cleanup, clear drops, roll reward and show a short title.
+    Returns: void */
     @EventHandler
     public void onArenaMobDeath(org.bukkit.event.entity.EntityDeathEvent ev) {
         org.bukkit.entity.Entity ent = ev.getEntity();
@@ -1115,12 +1093,10 @@ public class BattleManager implements Listener {
                     || "Enemy Infantry".equals(n) || "Enemy Archer".equals(n) || "Bandit".equals(n)) {
                 ev.getDrops().clear();
                 ev.setDroppedExp(0);
-                // roll for a drop and drop it into the world if present
                 try {
                     org.bukkit.inventory.ItemStack drop = RewardService.rollDrop(ent);
                     if (drop != null) ent.getWorld().dropItemNaturally(ent.getLocation(), drop);
                 } catch (Throwable ignore) {}
-                // show a quick title to all players in arena announcing the kill
                 try { Bukkit.getOnlinePlayers().forEach(pl -> TitleHelper.showTitle(pl, "§aTroop down", "A troop has fallen")); } catch (Throwable ignore) {}
             }
         }
@@ -1129,7 +1105,6 @@ public class BattleManager implements Listener {
     public List<Zombie> getInfantry() { return infantry; }
     public List<Skeleton> getArchers() { return archers; }
     public boolean isBattleRunning() { return battleRunning; }
-    /** Returns true when combat (the repeating combat ticker) is active */
     public boolean isCombatRunning() { return combatTaskId != -1; }
 
     public ArenaManager getArenaManager() { return this.arena; }
